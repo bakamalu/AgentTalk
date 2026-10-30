@@ -1,0 +1,4 @@
+#!/bin/bash
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")" || exit 1
+trap "" SIGPIPE
+exec xvfb-run -a env LD_PRELOAD=./libnapcat_launcher.so /opt/QQ/qq --no-sandbox "$@"

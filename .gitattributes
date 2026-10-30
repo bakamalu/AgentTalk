@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.md        text eol=lf
+*.js        text eol=lf
+*.json      text eol=lf
+*.service   text eol=lf
+*.example   text eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.tar.gz binary
+*.zip binary

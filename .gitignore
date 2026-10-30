@@ -1,0 +1,53 @@
+# ============================================================
+# 密钥与运行时状态：绝对不入库
+# ============================================================
+# 真实环境变量文件（含 API Key / Token / QQ 号）
+bot.env
+bot.env.*
+!bot.env.example
+*.env
+!*.env.example
+.env
+.env.*
+
+# 运行时状态：对话历史、用量统计
+state/
+**/state/
+histories.json
+usage.json
+*.sqlite
+*.sqlite3
+
+# 日志
+logs/
+*.log
+
+# NapCat / Koishi 运行数据
+config/napcat/webui.json
+config/napcat/passkey.json
+config/napcat/plugins/
+config/snowluma/
+
+# 备份（本地留痕，不入库；需要版本化请走 docs/）
+*.bak
+*.bak-*
+*.disabled-*
+
+# ============================================================
+# 依赖与构建产物
+# ============================================================
+node_modules/
+.pnpm-store/
+dist/
+lib/
+*.tsbuildinfo
+
+# ============================================================
+# 杂项
+# ============================================================
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+tmp/

@@ -1,0 +1,34 @@
+{
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [
+      {
+        "name": "koishi-ws",
+        "enable": true,
+        "host": "127.0.0.1",
+        "port": 3001,
+        "token": "<WS_TOKEN>",
+        "messagePostFormat": "array",
+        "reportSelfMessage": false,
+        "heartInterval": 30000,
+        "reconnectInterval": 5000,
+        "debug": false,
+        "enableCors": false
+      }
+    ],
+    "websocketClients": [],
+    "plugins": []
+  },
+  "musicSignUrl": "",
+  "enableLocalFile2Url": false,
+  "parseMultMsg": false,
+  "imageDownloadProxy": "",
+  "timeout": {
+    "baseTimeout": 10000,
+    "uploadSpeedKBps": 256,
+    "downloadSpeedKBps": 256,
+    "maxTimeout": 1800000
+  }
+}

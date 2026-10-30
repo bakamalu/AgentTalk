@@ -1,0 +1,16 @@
+[Unit]
+Description=QQ Bot Watchdog (NapCat + Koishi)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /opt/bot-watchdog.sh
+Restart=always
+RestartSec=5
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
