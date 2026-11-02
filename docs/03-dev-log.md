@@ -79,7 +79,7 @@ server: { port: 5140, host: '0.0.0.0' },
 
 ```bash
 # QQ bot 白名单（空 = 不设白名单，全部放行；有值 = 仅名单内）
-export BOT_ALLOWED_USERS="<ADMIN_UIN>"
+export BOT_ALLOWED_USERS="<UIN1>"
 export BOT_ALLOWED_GROUPS=""
 ```
 
@@ -281,7 +281,7 @@ fi
 
 - `/root/deploy/profile` 与迁移前备份 `diff` 结果：**完全一致**
 - 新登录 shell：`BOT_ALLOWED_USERS / BOT_ALLOWED_GROUPS / MODEL / BASE` 均能读到，`KEY_LEN=36`（只打印长度，不打印密钥）
-- 新 Koishi 进程（pid 230225）环境变量已带新名单：`BOT_ALLOWED_USERS=<ADMIN_UIN>,<USER2_UIN>`
+- 新 Koishi 进程（pid 230225）环境变量已带新名单：`BOT_ALLOWED_USERS=<UIN1>,<UIN2>`
 - 启动日志：`adapter connect to server: ws://127.0.0.1:3001/`
 
 ### 副作用（重要）
@@ -297,7 +297,7 @@ fi
 1. 环境变量只在**进程启动时**通过 `/etc/profile → /root/deploy/profile → /root/deploy/bot.env` 加载一次，守护进程内存里缓存的是旧值
 2. 服务配置了 `KillMode=process`，restart 只杀当前 systemd 主进程，**上一代旧守护/Koishi 孤儿进程不会被杀**，孤儿带着旧环境继续拉起 Koishi
 
-实测例证：19:00 已改 `BOT_ALLOWED_GROUPS=""`，但 19:08 拉起的 Koishi 仍是 `<OLD_UIN>`（由 18:54 的旧守护 230199 拉起）。
+实测例证：19:00 已改 `BOT_ALLOWED_GROUPS=""`，但 19:08 拉起的 Koishi 仍是 `<群A>`（由 18:54 的旧守护 230199 拉起）。
 
 改配置后的正确重启步骤：
 
@@ -317,7 +317,7 @@ tr '\0' '\n' < /proc/<koishi_pid>/environ | grep BOT_ALLOWED   # 应为新值
 grep 白名单 /opt/logs/koishi.log | tail -1                      # 应为实际生效策略
 ```
 
-19:11 重启后最终生效：`[白名单] 私聊 仅 <ADMIN_UIN>,<USER2_UIN>；群聊 不限制(所有群，需 @)`
+19:11 重启后最终生效：`[白名单] 私聊 仅 <UIN1>,<UIN2>；群聊 不限制(所有群，需 @)`
 
 ### 回滚
 
@@ -343,7 +343,7 @@ cp /etc/profile.bak-20261029-185329 /etc/profile
 |---|---|
 | `/opt/koishi/plugins/deepseek.js`（备份 `.bak-admin-191908`） | 新增 `adminUsers = toIdSet(BOT_ADMIN_USERS)`，空 = 无管理员；`handleAdminCommand()` 在白名单判断**之前**执行，指令不走频率闸、不进模型队列 |
 | `/opt/koishi/koishi.config.js`（备份 `.bak-admin-*`） | 新增 `adminUsers: process.env.BOT_ADMIN_USERS \|\| ''` |
-| `/root/deploy/bot.env`（备份 `.bak-admin`） | 新增 `export BOT_ADMIN_USERS="<ADMIN_UIN>"` |
+| `/root/deploy/bot.env`（备份 `.bak-admin`） | 新增 `export BOT_ADMIN_USERS="<UIN1>"` |
 
 ### 指令表（默认仅私聊生效；开启 BOT_ADMIN_GROUP 后群里 @机器人 也能用）
 
@@ -358,12 +358,12 @@ cp /etc/profile.bak-20261029-185329 /etc/profile
 
 涉及文件（改前已备份 .bak-admingroup*）：deepseek.js、koishi.config.js（adminGroup: process.env.BOT_ADMIN_GROUP || ''）、bot.env（export BOT_ADMIN_GROUP="" 默认关）。
 
-冒烟测试 5/5 PASS：开关关-群里无响应；开关开-群里出状态/重置；开关关-私聊正常；群里非管理员无响应。线上日志：`[管理员] 仅 <ADMIN_UIN>；生效范围 仅私聊`
+冒烟测试 5/5 PASS：开关关-群里无响应；开关开-群里出状态/重置；开关关-私聊正常；群里非管理员无响应。线上日志：`[管理员] 仅 <UIN1>；生效范围 仅私聊`
 
 ### 验证
 
 - 冒烟测试（假 API key，不碰线上）：管理员 `#状态`/`#重置对话` 有回复；非管理员 999999999 发 `#状态` 无回复
-- 按第九节流程重启后，新进程（19:20:47）环境含 `BOT_ADMIN_USERS=<ADMIN_UIN>`，日志：`[管理员] 仅 <ADMIN_UIN>`
+- 按第九节流程重启后，新进程（19:20:47）环境含 `BOT_ADMIN_USERS=<UIN1>`，日志：`[管理员] 仅 <UIN1>`
 
 ### 回滚
 
@@ -402,7 +402,7 @@ cp /opt/koishi/koishi.config.js.bak-admin-<时间戳> /opt/koishi/koishi.config.
 
 ### 验证
 
-19:42:55 重启后日志：`[白名单] 私聊 仅 <ADMIN_UIN>,<USER2_UIN>；群聊 不限制(所有群，需 @)`、`[管理员] 仅 <ADMIN_UIN>；生效范围 仅私聊`、`adapter connect to server: ws://127.0.0.1:3001/`
+19:42:55 重启后日志：`[白名单] 私聊 仅 <UIN1>,<UIN2>；群聊 不限制(所有群，需 @)`、`[管理员] 仅 <UIN1>；生效范围 仅私聊`、`adapter connect to server: ws://127.0.0.1:3001/`
 
 ### 自称/人格提示词（2026-10-29 19:51 追加）
 
@@ -473,3 +473,424 @@ cp /opt/koishi/koishi.config.js.bak-admin-<时间戳> /opt/koishi/koishi.config.
 **并发编辑提醒**：本次重启时发现 `deepseek.js` 被**另一个会话/编辑方并发修改**（加入了图片识别代码 `collectImages`/`downloadImageAsDataUrl`/`buildUserContent`，与 `BOT_IMAGE_MAX`/`BOT_IMAGE_TIMEOUT_MS`）。两次启动间文件内容不一致导致 21:29:23 那次启动撞上“半成品”报 `await is only valid in async functions`（当时文件正在写），21:32:50 重载完整合并版后正常。多个会话并行改同一文件风险极大：改前应 `stat` 看 mtime、改后多次 `node --check` 确认稳定再重启。
 
 **实盘验证**：21:32:50 插件干净加载，`[上下文] @前群聊上下文 最近 6 条/120s；@后免@活跃窗口 120s` 已打出，server 绑 127.0.0.1:5140、历史恢复 6 会话、累计 23 次调用。
+
+## 十六、S0 前置对齐 + 两起“看起来像锁残留”的真事故（2026-10-30）
+
+### 16.1 systemd 服务缺 `HOME` → QQ 在 prelogin 阶段 SIGILL 崩溃循环
+
+现场：`/opt/logs/napcat.log` 反复出现 `[launcher] loadNapCat.js generated` → `not mini app.` → `Illegal instruction (core dumped)`；`dmesg` 可见 `traps: qq[pid] trap invalid opcode ip:...0cf`（固定指令偏移，说明是确定性崩溃，不是随机坏内存）。诡异的是**手工 `bash /opt/launcher.sh` 或 `setsid nohup` 拉起就正常出码**。
+
+定位：用 `systemd-run` 复现并把 `env` 落盘，发现系统级 service 的环境里**没有 `HOME` / `USER` / `LOGNAME`**（手工 shell 有）。QQ 作为 Electron 应用，拿不到 `HOME` 就找不到 `~/.config/QQ` 配置根，在 prelogin 阶段直接死。
+
+验证：`systemd-run -p Environment=HOME=/root -p Environment=USER=root -p Environment=LOGNAME=root ...` → 一次就正常出码。
+
+修复（`ops/systemd/qqbot-watchdog.service`）：
+```ini
+Environment=HOME=/root
+Environment=USER=root
+Environment=LOGNAME=root
+Environment=SHELL=/bin/bash
+WorkingDirectory=/opt
+KillMode=mixed          # 原 process：只杀主进程，孤儿带旧环境继续跑
+```
+
+**教训**：以前所有“systemd 重启”其实都是**崩溃重启**，能活是因为有人手工拉起过。凡是“手工能跑、服务跑不了”的鬼故事，先 diff 两边 `env`。
+
+### 16.2 `/tmp/.X99-lock` 残锁 → `xvfb-run -a` 拿到脏显示号
+
+Xvfb 被 SIGKILL（`timeout` 杀、`pkill` 杀）后 `/tmp/.X99-lock` 与 `/tmp/.X11-unix/X99` 残留，下一次 `xvfb-run -a` 可能拿到脏号，QQ 同样 SIGILL。
+
+修复：`launcher.sh` 启动前扫描**高位显示号（≥90）**的锁，仅当 `fuser` 确认无人持有时删除锁与 socket（`:1024`/`:1025` 是 gdm 的 Xwayland，切勿动）。
+
+> 注意：`pkill -f 'xvfb-run'`、`pkill -f 'QQ/qq --no-sandbox'` 会**匹配到执行它的 shell 自身**（命令行里含同样字符串）→ 自杀式无输出。脚本里统一用 `b[o]t-watchdog` 这类括号技巧。
+
+### 16.3 掉登录态与快速登录
+
+`快速登录错误：登录态已失效，请重新登录` → 必须人工扫一次码。扫码成功前 WS 3001 不监听，Koishi 只能 `ECONNREFUSED`。
+
+修复：`launcher.sh` 支持 `NAPCAT_QUICK_LOGIN`（转成 NapCat 的 `-q <uin>`），`bot.env` 已配；守护重启后不再卡在二维码页。
+
+### 16.4 S0 其余项
+
+- 全量备份：`/root/deploy/migrate/20261030-112901/`（bot.env、profile、koishi 配置+plugins、napcat config、watchdog/launcher/.so、systemd unit、`state-deepseek/` 快照），`MANIFEST.sha256` 校验，`migrate/current` 软链指向最新。
+- WS token 两侧对齐：NapCat `onebot11_*.json` 与 `bot.env` 的 `NAPCAT_WS_TOKEN` 同值；Koishi 改为 `token: process.env.NAPCAT_WS_TOKEN`（不再空串）。
+- 收回回环：NapCat WS `0.0.0.0` → `127.0.0.1`；WebUI `::` → `127.0.0.1`（公网 6099 不再可达，远程走 SSH 隧道）。
+- 一键脚本：`switch-to-snowluma.sh` / `rollback-to-napcat.sh` 均支持 `--dry-run`（只做前置检查+打印计划，dry-run 会把前置缺口一次报全）；切换前置新增 token 对齐、watchdog 支持 `BOT_GATEWAY`、磁盘余量三项断言。
+- 只读闸门：`ops/s0-verify.sh`（14 项静态断言 + 2 项运行时）。
+
+### 16.5 export-from-server.sh 的密钥硬门槛修好
+
+原实现 `grep -E '...[0-9]{1,3}(\.[0-9]{1,3}){3}...'` 把 `127.0.0.1` 也算违规——仓库里 63 行命中全是回环地址，**门槛等于永远中止，从未真正生效**。改为：
+
+1. 先脱敏：WebUI token → `<WEBUI_TOKEN>`、WS token → `<WS_TOKEN>`、QQ 号（含 `NAPCAT_QUICK_LOGIN`）→ `<BOT_UIN>`、管理员 → `<UIN*>`；
+2. 文档里 IPv4 一律占位化（先保护 `127.0.0.1`/`0.0.0.0`/`::1`，全替成 `<SERVER_IP>`，再还原）；
+3. 再扫描，回环放行、其余（`sk-` 密钥 / 公网 IP / 真 token）一律中止。
+
+首次运行就抓到 `docs/02-operations.md` 里一条真实公网 IP，已改为本机回环 + SSH 隧道写法。
+
+## 十七、SnowLuma 正式落地：从“源码构建”改为“release 包 + 容器”（2026-10-30）
+
+结论先写：**SnowLuma v2.2.1 的官方 linux-x64 release 包在本机 Ubuntu 20.04 上跑不起来，
+原因是原生层的 glibc 门槛，不是 JS 层问题。** 最终方案是 QQ + SnowLuma 一起进 ubuntu:24.04 容器，
+宿主 OS 一个包都不动。
+
+### 17.1 硬门槛：GLIBCXX_3.4.29 + GLIBC_2.32/2.33/2.34
+
+W0 冷启动时 WebUI 正常（5099 起得来），但每 1.5s 刷一条：
+
+```
+[Hook] process enumeration failed: /lib/x86_64-linux-gnu/libstdc++.so.6:
+  version `GLIBCXX_3.4.29' not found (required by native/snowluma-linux-x64.node)
+```
+
+`ldd -r` / `objdump -T` 实测需求：
+
+| 文件 | 需要的符号版本 |
+|---|---|
+| `native/snowluma-linux-x64.node` | `GLIBCXX_3.4.29`、`GLIBC_2.32`、`GLIBC_2.33`、`GLIBC_2.34` |
+| `native/snowluma-linux-x64.so` | `GLIBC_2.32`、`GLIBC_2.34` |
+
+本机 Ubuntu 20.04：glibc 2.31 / GLIBCXX 3.4.28。**换 libstdc++ 没用**（缺的是 glibc，
+`dlopen`/`dladdr`/`__libc_single_threaded` 都在 2.34 才齐全）。三条路里选容器（另两条：
+就地升 22.04 会牵动 QQ/NapCat/Koishi 全部运行库；暂缓等于不迁移）。
+
+### 17.2 容器镜像的三个坑
+
+1. **`ubuntu:24.04` 基础镜像没有 ca-certificates**。换阿里云 `https://` 源后 apt 全报
+   `Certificate verification failed / No system certificates available`，而 `ca-certificates`
+   本身又得靠 apt 装 —— 死循环。解法：源用 `http://mirrors.aliyun.com/ubuntu` 先把包装上。
+2. **包名要对 24.04**：`libatk1.0-0t64`、`libatk-bridge2.0-0t64`、`libatspi2.0-0t64`、
+   `libcups2t64`、`libasound2t64`、`libgtk-3-0t64` 是 t64 名，照抄 20.04 的 `libatk1.0-0` 会
+   `Unable to locate package`（连带把后续包全判成找不到）。
+3. **扫码要用 x11vnc**：SnowLuma 是 hook 式，登录二维码在 **QQ 自己的 X 窗口**里，release 包
+   没有“把登录二维码推给 WebUI”的能力（WebUI 里的二维码是 2FA 用的）。无头机只能看屏，
+   所以镜像带 `x11vnc`，entrypoint 在 `SNOWLUMA_VNC=1` 时以 `-localhost` 起在 5900，
+   由用户走 SSH 隧道访问。
+
+镜像与运行时参数固化在 `ops/snowluma/container/{Dockerfile,entrypoint.sh,run.sh}`，
+其中 `--cap-add=SYS_PTRACE` + `seccomp=unconfined` 是必须的（注入靠 ptrace/dlopen，
+不是 `LD_PRELOAD`），`--network host` 让 3001/5099 继续走回环。
+
+### 17.3 `start.sh` 静默 exit 1：`. /etc/profile` 的 exit 拦不住
+
+现象：`timeout 20 /opt/snowluma/start.sh` 返回 1 且**一行输出都没有**，但直接
+`./node ./index.mjs` 正常。`bash -x` trace 只走到 `. /etc/profile` 就断了（因为这一行的
+`>/dev/null 2>&1` 把后续 xtrace 也一起吞了）。
+
+根因：`set -e` 下写 `[ -f /etc/profile ] && . /etc/profile || true`，`|| true` 只能兜“返回非 0”，
+**兜不住 profile 内部直接 `exit`** —— 整个脚本当场结束。而容器里没有同一套 profile.d，所以同一脚本
+在容器内是好的，这个坑只在宿主暴露。
+
+修复：start.sh 不再 source 任何 profile，显式给 `PATH` / `LANG` / `HOME` / `USER` / `LOGNAME`。
+
+### 17.4 注入链路实测（这是全流程唯一真正不确定的点）
+
+容器内 `SNOWLUMA_HOOK_AUTOLOAD=1` 后：
+
+```
+15:27:14 INFO [App] hook auto-load enabled: every discovered QQ process will be injected
+15:27:15 INFO [Hook] awaiting login: PID=19
+15:27:15 INFO [Hook] pipe connected: PID=19
+```
+
+手动路径也验过（走 WebUI API，`/api/processes` → `POST /api/processes/<pid>/load`）：
+返回 `injected:true, method:loadModuleManual, status:connecting`。
+
+两个必须对齐的前提：
+
+- `SNOWLUMA_HOOK_RUNTIME_DIR` 必须进 **QQ 进程的 environ**（supervisor 先读目标进程 environ，
+  其次 `XDG_RUNTIME_DIR`，最后 `/tmp/snowluma-<uid>`）。所以 entrypoint 在拉 QQ **之前**
+  就把 env 文件 source 进自己的环境，QQ 继承之。
+- 容器内没有 `/run/user/0`，天然不会被 `XDG_RUNTIME_DIR` 带偏；宿主直接跑则必须显式导出。
+
+### 17.5 WebUI 口令：`config/webui.json` 一旦存在，播种就失效
+
+`SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD` 只在**没有** `config/webui.json` 时生效（播种后
+`mustChangePassword=false`）。之前手工直接跑过一次 `./node ./index.mjs`，生成了随机口令的
+`webui.json`（`mustChangePassword=true`），后续 env 里的口令就被无视了。
+
+处理：删掉（改名备份）`config/webui.json` 再启动，日志出现
+`webui credentials seeded from SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD` 才算对。
+
+### 17.6 生产为什么停着：账号风控 168
+
+`/opt/logs/napcat.log` 在 13:35 扫码后：
+
+```
+Login Error ... serverErrorCode: 168 你的账号近期存在安全风险，部分功能使用受限
+```
+
+这是平台侧限制，换网关不会好转，必须在手机 QQ 走申诉/验证。因此本次不把生产回拉，
+SnowLuma 侧停在“注入链路已验证、等待一次合法登录”。
+
+### 17.7 顺带：IDE 吃内存的实测口径
+
+同一时刻宿主跑了两个 IDE 后端：`~/.vscode-server`（9 进程，PSS 368MB + swap 391MB，
+其中一个 extensionHost `VmHWM 647MB / RSS 316MB / Swap 316MB`）与 `~/.qoder-server`
+（9 进程，PSS 412MB + swap 178MB）。
+
+停掉 vscode-server + 两个 21h/1d 的陈旧 CLI 后：`used 1113MB → 768MB`、
+`available 574MB → 921MB`、`swap 949MB → 552MB`。1.8G 的机器上，单个 IDE 后端就该按
+250–400MB 预留，长时间跑业务建议内存升到 4G。
+
+---
+
+## 十八、无头机扫码取码实录（2026-10-30）
+
+### 18.1 背景
+
+SnowLuma 不代理 QQ 登录二维码：WebUI 页面上唯一带“二维码”字样的是 **2FA 绑定**，
+`index.mjs` 里没有任何 qrcode 依赖。二维码只存在于 QQ 自己的 X 窗口内，所以无头机必须
+“看屏”或“截屏”。
+
+### 18.2 手法：容器内 `scrot` + `xdotool`（已封装成 `run.sh shot`）
+
+```bash
+# ① 截全屏 + 只截二维码（scrot 已固化进镜像，不需要任何 apt-get）
+./ops/snowluma/container/run.sh shot
+#   → /opt/snowluma/logs/qq-screen.png（1280x800 整屏）
+#   → /opt/snowluma/logs/qq-qr.png    （二维码区域 540,310,202,208）
+
+# ② 手动点控件（xdotool 同样在镜像里）
+docker exec qqbot-snowluma env DISPLAY=:99 xdotool mousemove 597 592 click 1
+```
+
+关键坐标（1280x800，2026-10-30 复核）：
+
+| 控件 | 坐标 | 说明 |
+|---|---|---|
+| 底部“扫码登录”链接 | (597, 592) | `-q` 启动时停在**密码页**，点这里才切到扫码页 |
+| “当前二维码已过期”里的“刷新”按钮 | (640, 448) | 过期后必须点一下才会出新码 |
+| 风控弹窗“确认” | (720, 467) | 关掉弹窗，否则挡住二维码 |
+
+点击后 `sleep 3~5` 再截（Xvfb 没有 XDAMAGE，画面刷新有延迟）。
+
+> 启动参数 `SNOWLUMA_QUICK_LOGIN=<uin>` 会让 entrypoint 给 QQ 传 `-q <uin>`：
+> 已登录过的号直达，**从没在这容器里登录过的号则停在"账号已回填 + 密码框"的页面**。
+> 想扫码不是改配置，而是点上面的“扫码登录”链接。
+
+### 18.3 两个坑
+
+1. **二维码约 2 分钟就过期**，过期后页面显示“当前二维码已过期”，此时截出来是灰底残影，
+   必须**点刷新按钮**才会出新码 —— 直接把旧图发给别人会扫失败。
+2. ~~`scrot` / `xdotool` 是 `docker exec` 临时装进容器的，容器一重建就没。~~
+   **已修**（P1-1）：两个包写进 `ops/snowluma/container/Dockerfile` 的 apt 列表，
+   `run.sh shot` 在**干净容器**里直接可用，不再依赖"往运行中容器里装包"。
+   教训：凡是 `docker exec apt-get install` 出来的能力，都会随容器重建一起消失。
+
+### 18.4 风控复现（结论不变）
+
+扫码后 QQ 客户端直接弹出模态框：
+
+> 提示
+> 你的账号近期存在安全风险，部分功能使用受限，请登录最新手机QQ并根据提示恢复账号使用。
+
+与 NapCat 时代日志里的 `serverErrorCode: 168` 完全对应：风控发生在**平台侧**，与网关实现无关。
+扫码链路本身是通的（`awaiting login` → 扫码 → 被拒），所以只要账号恢复，这一次扫码即可完成 W1。
+
+安全提醒：二维码截图等同于一次性登录授权，用完即删，别入库、别发群。
+
+---
+
+## 十九、首次登录成功，以及一次"自己杀掉自己"的事故（2026-10-30 20:20）
+
+### 19.1 登录成功（19:43–20:03，约 20 分钟窗口）
+
+手机扫码后平台风控这次**没有拦**，SnowLuma 全链路一次通：
+
+```
+19:48:15 OK  [Hook] login detected: PID=20 UIN=<UIN>
+19:48:17 INFO [Bridge] self info: nickname=<BOT_NICKNAME>
+19:48:17 INFO [Bridge] groups loaded: count=4
+19:48:18 INFO [Bridge] member warmup completed: groups=4/4 members=949 failed=0
+19:48:21 OK  [OneBot.WS-Server] [koishi] listening 127.0.0.1:3001
+```
+
+`onebot_<UIN>.json` 由 supervisor 自动生成，`verify-onebot.sh` 11 项全绿
+（overlay / 生成物 host=127.0.0.1、port=3001、token 与 `bot.env` 一致、
+messageFormat=array、3001 只听回环）。
+
+> 结论修正：风控 168 **不是"永久拒绝"**，而是"某段时间窗口内拒绝"。同一个账号、
+> 同一个客户端，19:43 扫码成功。把 168 当成账号已死是误判。
+
+### 19.2 事故：容器模式下的 `pkill -f '/opt/QQ/qq'` 会杀掉容器自己的 QQ
+
+切网关时 `qqbot-watchdog` 启动，日志：
+
+```
+[20:03:10] 守护进程启动 (网关=snowluma, 检查间隔 20s)
+[20:03:10] 检测到宿主 NapCat(QQ)，先停掉（容器模式独占端口）   ← 误判
+```
+
+随后容器内 QQ（PID=20）被杀，entrypoint 的 `while true` 10s 判活又把它拉起来
+（新 PID），但带 `-q <UIN>` 停在快速登录页 → `127.0.0.1:3001` 消失。
+
+**根因**：`bot-watchdog.sh` 的互斥逻辑用宿主侧
+`pgrep -f '/opt/QQ/qq --no-sandbox'` 判断"宿主是否有 NapCat"。而 PID namespace
+只挡住**容器看不到宿主**这一个方向，**宿主 `ps`/`pgrep` 能命中容器内进程**
+（`docker top` 与宿主 `ps` 里是同一批 PID）。于是容器模式下一启动 watchdog，
+就把自己容器的 QQ 当"宿主 NapCat"杀掉。
+
+**修复**（`ops/bot-watchdog.sh`，/opt 与仓库两份已同步）：
+
+```bash
+# 容器内进程的宿主 PID 列表
+sl_pids() { docker top "$SL_CONTAINER" -o pid | tail -n +2 | tr -d ' \r' | tr '\n' ' '; }
+
+# 只挑出真正的宿主 NapCat：pgrep 命中后逐个扣掉容器内 PID
+host_napcat_pids() {
+  local sp; sp=" $(sl_pids) "
+  for pid in $(pgrep -f '/opt/QQ/qq --no-sandbox') $(pgrep -f 'xvfb-run -a /opt/QQ/qq'); do
+    case "$sp" in *" $pid "*) continue ;; esac
+    echo "$pid"
+  done
+}
+```
+
+互斥段改为 `[ -n "$(host_napcat_pids)" ]` 判断 + `stop_host_napcat` 定点 `kill`，
+不再 `pkill -f` 全量匹配。重启 watchdog 后日志不再出现该行，验证通过。
+
+**教训**：容器化之后，任何"在宿主上按命令行特征杀进程"的代码都必须先扣掉容器
+PID —— 这不只影响 watchdog，`switch-to-snowluma.sh` 里历史遗留的宿主 `pkill`
+同样要审（已加注释说明"能命中但杀不干净"的原因）。
+
+### 19.3 修复后重启撞回风控（预期内的第二道坎）
+
+watchdog 重启 → 触发容器重建 → QQ 停在快速登录页 → 点"登录" → 又弹 168 风控。
+这不是新问题，是 19.2 的连锁反应：**在很短时间里经历"登录成功→被踢下线→立刻
+重新登录"**，风控把这种模式当异常。
+
+处置原则（保持不变）：**停手等待**。同一账号短时间内连续登录失败只会延长窗口。
+等 10–30 分钟后再扫一次；成功后第一件事是确认 `host_napcat_pids` 为空（即没有
+"宿主 NapCat"误判），再让 watchdog 常驻。
+
+### 19.4 顺带确认的两件事
+
+1. **VNC 可以不停容器关掉**：`docker exec qqbot-snowluma pkill -f x11vnc` 即可，
+   entrypoint 的判活循环只管 QQ、不管 x11vnc，所以不会复活；`3001` 与登录态
+   都不受影响。`snowluma.env` 已同步改 `SNOWLUMA_VNC="0"`，下次重建也不会再起。
+2. **`verify-onebot.sh` 存在循环依赖**：它把"Koishi 已连接"当硬条件，而 Koishi
+   只在切网关（enable watchdog）后才起。已加 `-k/--skip-koishi`：切换前用 `-k`
+   校验 overlay/生成物/端口，切换后再完整核验。`post-login.sh` 已按此改。
+
+### 19.5 系统侧告警（需留意，非本次事故原因）
+
+```
+qqbot-watchdog.service: Failed to add control inotify watch descriptor
+for control group ...: No space left on device
+```
+
+`inotify` 实例数耗尽（`fs.inotify.max_user_instances`），不是磁盘满。它与
+"容器内进程多、watchdog 频繁重启"叠加会触发。1.8G 内存机器上
+（`swap 已用 552MB`）建议连同 P3-1 一起处理：调高 `max_user_instances`
+或减少同时运行的 Electron 实例。
+
+---
+
+## 二十、插件模块化拆分 + 天气独立数据源（2026-11-02）
+
+> 10-31 的改动（时间注入、联网搜索、`botctl.sh`）都记在 `docs/06-snowluma-todo.md`
+> 的 P1-11 / P1-12，本节之前没补录——**以后以大改动为准补录，不要两处都只记一半**。
+
+### 20.1 触发点：`deepseek.js` 已经堆到 1014 行
+
+一个文件里同时管着：消息解析、唤醒判定、连发合并、上下文、名单/敏感词、热配置解析、
+历史与用量落盘、Bing 抓取、HTML 实体解码、分段发送、频率闸、引用兜底（含给 adapter
+打 monkey-patch）、模型循环。再加上 11-02 排查“天气答不准”（根因见 `06` 的 P1-11 (c)）
+发现**天气需要一个新的数据源层**，如果不拆就得变 1200 行。
+
+### 20.2 拆分结果（行为不变，只改结构）
+
+| 模块 | 行数 | 职责 | 拆出去的关键点 |
+|---|---|---|---|
+| `bot/plugins/deepseek.js` | 589（原 1014） | 只剩消息流编排 + 模型调用循环 | 新增能力不再往这里堆 |
+| `lib/text.js` | 91 | CQ 码/Markdown 转纯文本、分段、HTML 实体、时间注入 | `timeLine()` 必须用本地时区，禁用 `toISOString()` |
+| `lib/hotconfig.js` | 144 | `bot.env` 热配置层 | 优先级：文件 > config > 进程env > 默认；新增 `BOT_WEATHER_*` 三个键 |
+| `lib/store.js` | 85 | 多轮上下文 + token 用量落盘 | 400ms 防抖；`maxTurns` 逐会话裁剪 |
+| `lib/sender.js` | 96 | 频率闸 + 文本整形 + OneBot 投递路由 | `reply` 是 **message 数组元素**，不是 `send_group_msg` 的第三参数（P1-10） |
+| `lib/quote.js` | 134 | 引用原文三层兜底 | `getMessage` 猴补丁必须返回完整 quote 结构（不只是 text） |
+| `lib/tools.js` | 77 | 工具注册表：能力在这里挂载与分发 | `schemas()` 与 `describeCapabilities()` **必须同源**，否则能力边界与实际下发不一致 |
+| `lib/weather.js` | 169 | **天气（本次新增）** | Open-Meteo 主 + wttr.in 兜底 + 地理编码缓存 |
+| `lib/websearch.js` | 166 | 联网搜索 | 查询词归一化 + 质量闸 + 无效自动重试 |
+
+三个必须记住的实现约束：
+
+1. **`lib/` 放在 `plugins/` 之外**。线上目录是 `/opt/koishi/plugins/` + `/opt/koishi/lib/`，
+   插件里写 `require('../lib/xxx')` —— 这种写法在仓库（`bot/plugins` + `bot/lib`）和线上
+   两种目录结构下都能解析，**不需要任何路径映射或打包步骤**。若把 `lib` 放进 `plugins/`，
+   Koishi loader 会把每个 js 都当插件装载。
+2. **工具执行失败永远返回文本，不抛出**。一旦抛出，整轮会静默失败（用户看到的就是“没回复”）；
+   返回“查不到，请如实告知用户”则模型会正常组织语言。天气、搜索都遵守这条。
+3. **能力描述与实际下发工具同步**。`tools.js` 里 `schemas()` 根据 `hot.searchEnabled /
+   hot.weatherEnabled` 决定给不给工具，`describeCapabilities(hot)` 生成拼在 system prompt 后面
+   那行能力声明（含“天气必须用 get_weather、web_search 要用短查询”）。两者同库同函数，
+   不会再出现“说能搜但实际关了”。
+
+### 20.3 部署链路必须跟着改（否则上线即坏）
+
+`scripts/botctl.sh sync plugin` 旧版**只 cp `deepseek.js` 一个文件**。拆分后如果沿用，
+线上会变成“新主体 + 无 lib” → `Cannot find module '../lib/text'` → **插件直接加载失败、
+机器人离线**。已改造为：
+
+- 一次同步 `plugins/deepseek.js` + `bot/lib/*.js`（共 9 个）到 `/opt/koishi/{plugins,lib}/`；
+- diff 预检覆盖全部文件（首次部署时线上无 `lib/`，会被当成“有差异”，需 `FORCE=1` 确认，属预期）；
+- **逐文件备份 + 逐文件 `node --check`**，任一失败则全部回滚且不重启；
+- `mkdir -p /opt/koishi/lib` 在 cp 前。
+
+同时修了 `botctl.sh` 两个使运维判据不可信的缺陷（11-02 部署时实际踩到）：
+
+- `restart koishi` 写死 `sleep 8` 就查 5140，而实测 Koishi 要 **~35s** 才监听
+  → 报“5140 未监听”的**假失败**，很容易诱导再重启一次。改为最多 90s 轮询，并输出实际等了多久。
+- `verify` 把“秒数”当成位置参数传给 `verify-onebot.sh`（它只接 `-q/-k`）
+  → **永远“未知参数”直接退出**，等于部署后的只读核验闸门从来没跑过。已改为
+  滤空参数 + 端口走 `PORT` 环境变量。
+
+### 20.4 验收（全绿才算完成）
+
+```
+node --check 全部 9 个文件                          OK
+bash -n scripts/botctl.sh                       OK
+node scripts/smoke-plugin.js                  16 项断言全绿
+/opt/koishi/lib/ 落地 9 个文件且与仓库 diff 为空     OK
+启动横幅 [天气] 开（Open-Meteo 主 + wttr.in 兜底；默认城市 苏州）  OK
+历史 10 个会话恢复 + [引用诊断] 已挂钩 getMessage      OK
+botctl.sh verify                              12 项全通过
+botctl.sh gate（s0-verify）                    39 项通过 0 失败
+```
+
+冒烟测试脚本 `scripts/smoke-plugin.js` 的三个要点（下次改插件直接跑它）：
+
+- **先清空继承来的 `BOT_*` 环境变量**再 require 插件。登录 shell 会从 `/etc/profile` →
+  `/root/deploy/profile` → `bot.env` 注入真实值，不清则白名单/管理员用的是线上配置，
+  **断言会静默失真**（看着绿其实测的是旧配置）；
+- 只拦 `/chat/completions`（脚本化：奇数次返 `tool_calls`、偶数次返文字），**其余 fetch 放行真实网络**，
+  这样能验证工具链真的拿到了气象数值（断言 `role=tool` 内容含 `℃`）；
+- 工具往返要跑两次真实 HTTP（地理编码 + 预报），**固定短等待会误判**，已改成 `waitUntil` 轮询。
+
+### 20.5 本次写错的几处（`node --check` 全部兜住了，但都是“拆分时手抄”造成的）
+
+- `text.js`：`.replace(/&lt;/g; '<')` —— 分号当逗号；
+- `weather.js`：模板串 `【${String(city).trim())}】` 多一个括号；
+  `WTTR_EN_ZH` 里 `moderate rain` / `heavy rain` **未加引号** → `SyntaxError: Unexpected identifier 'rain'`；
+- `websearch.js` 质量闸首版误判垃圾为有效：旧逻辑用“**任一** token 命中”判有效，而实体兜底页
+  必然命中主体词（苏州）；GENERIC_TITLE 正则又错误地锚了结尾 `$`。新规则见 P1-11 (d)；
+- `quote.js` 猴补丁首版只返回 `{content, messageId}`，**丢了 adapter 需要的其余字段**；
+- `deepseek.js` 里 `searchedBrief` 声明晚于使用（TDZ 靠执行顺序才能跑，很脆）；
+- 自己引入的行为回退：`#状态` 里原本的“频率闸：N 条/分，间隔≥Nms”限值行被换成
+  “rateState.size 个会话计数中”——**信息丢了**。现改为 `sender.rateDesc()`（必须是函数，
+  存成字符串则 size 永远是 0），既保留限值也带上计数。
+
+> 经验：`node --check` 只查语法，**查不出未定义变量、作用域错误、缺模块**；
+> 拆文件后的第一道闸门应该是冒烟测试而不是它。
+
+### 20.6 待补 / 已知风险
+
+- ⚠ **真实 QQ 群里人工实测未做**（本轮只到插件级）。验证方式：在白名单群 <GROUP_ID>
+  @机器人问“今天苏州天气”，应直接拿到温度/降水数值；日志里应出现
+  `DeepSeek 回复 … 工具=get_weather(...)` 与 `[回复] …`。
+- 关掉 `BOT_WEATHER_ENABLED` 后，天气类问题会回退到“让模型用 web_search”——而搜索给不出
+  数值（见 P1-11 (c)），所以**不要只关天气不告知用户**。
+- Open-Meteo 是区县级坐标的模型数据，与中央气象台官方播报会有 1℃ 左右差异；要完全对齐
+  官方口径需换带 key 的商业气象 API。
+- 新发现一条与本次无关的可靠性问题：Koishi ↔ 3001 的 WS 11-02 当日掉线 14 次（从 09:24 起，
+  **早于本次部署**），已记为 `06` 的 P2-9。

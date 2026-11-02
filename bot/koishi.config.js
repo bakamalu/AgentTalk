@@ -13,8 +13,8 @@ module.exports = {
     'adapter-onebot': {
       protocol: 'ws',
       endpoint: process.env.NAPCAT_WS_ENDPOINT || 'ws://127.0.0.1:3001',
-      selfId: process.env.NAPCAT_SELF_ID || '',
-      token: '',
+      selfId: process.env.NAPCAT_SELF_ID || '<BOT_UIN>',
+      token: process.env.NAPCAT_WS_TOKEN || '',
     },
     './plugins/deepseek': {
       apiKey: process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY,

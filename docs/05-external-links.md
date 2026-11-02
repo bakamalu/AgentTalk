@@ -35,6 +35,9 @@
 | SnowLuma SDK | https://www.npmjs.com/package/@snowluma/sdk |
 | SnowLuma MCP | https://www.npmjs.com/package/@snowluma/mcp |
 | DeepSeek API | https://api.deepseek.com |
+| Koishi 企业微信适配器（微信方案 A，待引入） | https://koishi.chat/zh-CN/plugins/adapter/wecom.html |
+| 企微智能机器人长连接（微信方案 B，待引入） | https://developer.work.weixin.qq.com/document/path/101463 |
+| Wechaty（微信方案 C，缓议） | https://github.com/wechaty/wechaty |
 | 机器人改造 playbook | https://github.com/rentaoyan0628-collab/dsh-qq-bot-playbook |
 | qq-bridge（功能对照用） | https://github.com/Derpyu520/qq-bridge |
 

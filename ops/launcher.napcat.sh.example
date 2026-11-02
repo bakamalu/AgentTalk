@@ -1,4 +1,57 @@
 #!/bin/bash
+# 用途：headless 下用 xvfb 拉起 QQ 并注入 NapCat。
+# NAPCAT_QUICK_LOGIN：快速登录号。不设则 NapCat 回退二维码，无人值守会永久卡住。
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")" || exit 1
 trap "" SIGPIPE
+
+# 清理被杀掉的 Xvfb 留下的残锁：脏显示号会让 QQ 直接 SIGILL 崩溃循环。
+# 只碰 xvfb-run 使用的高位显示号（>=90），绝不碰 gdm 的低位显示（含 Xwayland）。
+#
+# 三种情况分开处理（经历两次事故后补的）：
+#   1. 有 X 客户端连着      → 显示号正在用，跳过
+#   2. 无客户端 + 持有者是孤儿 Xvfb（PPID=1）→ 这是上次被 timeout 杀掉 xvfb-run
+#      后留下的尸体，它自己占着 socket（所以 fuser 非空），收尸并清锁
+#   3. 无客户端 + 无持有者   → 纯残锁，直接删
+clean_x11_leftovers() {
+  local l n sock pids p ppid comm orphan other
+  for l in /tmp/.X*-lock; do
+    [ -e "$l" ] || continue
+    n=${l#/tmp/.X}; n=${n%-lock}
+    case "$n" in (*[!0-9]*) continue;; esac
+    [ "$n" -ge 90 ] 2>/dev/null || continue
+    sock="/tmp/.X11-unix/X$n"
+
+    # 1. 有客户端在用就放过
+    ss -x 2>/dev/null | grep -q "X11-unix/X$n\b" && continue
+
+    pids=$(fuser "$sock" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$')
+    orphan=0; other=0
+    for p in $pids; do
+      ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+      comm=$(cat "/proc/$p/comm" 2>/dev/null)
+      if [ "$comm" = "Xvfb" ] && [ "$ppid" = "1" ]; then
+        orphan=1
+      else
+        other=1
+      fi
+    done
+    # 持有者里有非孤儿 Xvfb 的进程 → 可能是有人在用的显示，不碰
+    [ "$other" = 1 ] && continue
+
+    if [ "$orphan" = 1 ]; then
+      for p in $pids; do kill -TERM "$p" 2>/dev/null; done
+      sleep 1
+      for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+      echo "[launcher] 收尸孤儿 Xvfb :$n"
+    fi
+    rm -f "$l" "$sock" && echo "[launcher] 清理残锁 :$n"
+  done
+}
+
+clean_x11_leftovers
+
+QL=${NAPCAT_QUICK_LOGIN:-}
+if [ -n "$QL" ]; then
+  exec xvfb-run -a env LD_PRELOAD=./libnapcat_launcher.so /opt/QQ/qq --no-sandbox -q "$QL" "$@"
+fi
 exec xvfb-run -a env LD_PRELOAD=./libnapcat_launcher.so /opt/QQ/qq --no-sandbox "$@"

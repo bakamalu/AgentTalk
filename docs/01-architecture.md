@@ -15,11 +15,18 @@ QQ NT 客户端（Linux，headless 需 xvfb）
 框架层：Koishi 4.18 + @koishijs/plugin-adapter-onebot@6
   │  Session 抽象
   ▼
-业务层：plugins/deepseek.js
+业务层：plugins/deepseek.js（消息流编排 + 模型调用循环）
+  │  └─ require('../lib/*')：weather / websearch / tools / hotconfig
+  │     / store / sender / quote / text（与 plugins 同级的 lib 目录，
+  │     放 plugins/ 里会被 Koishi loader 当插件装载）
   │  OpenAI 兼容 HTTP
   ▼
 模型层：DeepSeek /chat/completions
 ```
+
+**能力层与业务层的分工**：工具（`get_weather`、`web_search`）的定义、执行、
+以及给模型的那句能力声明，全部集中在 `lib/tools.js`（它按开关决定下发哪几个工具）。
+新增一种能力 = 新增一个 `lib/xxx.js` + 在 `tools.js` 注册；**不要往 `deepseek.js` 里堆**。
 
 **边界原则**：业务层不依赖具体网关实现，只依赖 OneBot v11 语义。
 这是"换网关不动插件"的前提，也是迁移方案成立的基础。

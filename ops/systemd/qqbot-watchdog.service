@@ -1,14 +1,31 @@
 [Unit]
-Description=QQ Bot Watchdog (NapCat + Koishi)
+Description=QQ Bot Watchdog (NapCat 或 SnowLuma 容器 + Koishi)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/bin/bash /opt/bot-watchdog.sh
+WorkingDirectory=/opt
+# 网关二选一，由 /root/deploy/bot.env 的 BOT_GATEWAY 决定：
+#   napcat = 本机直跑 QQ+NapCat（宿主 glibc 2.31）
+#   snowluma = docker 容器 qqbot-snowluma（QQ + SnowLuma supervisor，glibc 2.39）
+# 所以这个 unit 不止管 NapCat：容器不自启（run.sh 用 --restart no），
+# 宿主重启后**只有这条 watchdog**能把容器拉起来（P2-2）。
+# 系统级服务默认不带 HOME/USER：QQ(Electron) 拿不到 HOME 会在 prelogin 阶段
+# 直接 SIGILL 崩溃循环（见 docs/03-dev-log.md "systemd 缺 HOME"）。
+Environment=HOME=/root
+Environment=USER=root
+Environment=LOGNAME=root
+Environment=SHELL=/bin/bash
 Restart=always
 RestartSec=5
-KillMode=process
+# 必须混合杀：process 只杀主进程，守护/QQ/Koishi 会变孤儿并带着旧环境
+# 继续跑（历史事故：改了 bot.env 重启不生效）。mixed = 先 TERM 主进程，
+# 超时后 KILL 整个 cgroup。
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=25
 StandardOutput=journal
 StandardError=journal
 

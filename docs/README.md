@@ -7,6 +7,8 @@
 | [03-dev-log.md](03-dev-log.md) | 从零到现在的完整改造记录（19 项修复 + 踩坑） | 追溯"为什么这么写" |
 | [04-migration-snowluma.md](04-migration-snowluma.md) | 网关迁移路线 B：三次可回滚窗口 | 执行迁移的人 |
 | [05-external-links.md](05-external-links.md) | 第三方项目外链、许可与版本 | 环境重建 |
+| [06-snowluma-todo.md](06-snowluma-todo.md) | SnowLuma 收尾待办（P0~P3，含风控阻塞与脚本债） | 接手收尾 / 恢复登录 |
+| [07-wechat-bot.md](07-wechat-bot.md) | 微信机器人接入方案（选型对比、架构映射、实施路线） | 决定"微信怎么接"的人 |
 | [decisions/](decisions/) | ADR（架构决策记录） | 想知道"为什么不选另一个" |
 
 ---

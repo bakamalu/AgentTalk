@@ -9,8 +9,9 @@ NapCat:
 http://127.0.0.1:6099/webui/web_login
 
 opt/napcat/config/webui.json
-http://<SERVER_IP>:6099/webui/web_login
-用户名：<WEBUI_USER>
+（2026-10-30 S0：host 已从 `::` 收回 `127.0.0.1`，公网不再可达；
+远程访问请走 SSH 隧道：`ssh -L 6099:127.0.0.1:6099 <user>@<SERVER_IP>`）
+用户名：napcat-webui
 Token： <WEBUI_TOKEN>
 
 <BOT_UIN>
@@ -66,3 +67,66 @@ systemctl start qqbot-watchdog    # 等 20~30s 守护循环拉起 Koishi
 tr '\0' '\n' < /proc/<koishi_pid>/environ | grep BOT_ALLOWED
 grep 白名单 /opt/logs/koishi.log | tail -1
 ```
+
+---
+
+## SnowLuma（容器模式）运维（2026-10-30 落地）
+
+> 与 NapCat **二选一**，端口同为 `3001`，由 `bot.env` 的 `BOT_GATEWAY=napcat|snowluma` 决定，
+> watchdog 会互斥清理另一方。为什么用容器：SnowLuma 原生层要 glibc ≥ 2.34（宿主是 2.31）。
+
+容器 = QQ + Xvfb + SnowLuma supervisor，三者在同一个 `ubuntu:24.04` 里。
+
+```bash
+# 状态（容器 / 容器内三类进程 / 端口 5099+3001+5900）
+./ops/snowluma/container/run.sh status
+# 起停
+./ops/snowluma/container/run.sh up
+./ops/snowluma/container/run.sh down
+# entrypoint 日志（Xvfb/QQ/supervisor 的启停轨迹）
+docker logs qqbot-snowluma
+```
+
+| 项 | 位置 |
+|---|---|
+| WebUI | `http://127.0.0.1:5099`（远程走 SSH 隧道），口令在 `/root/deploy/snowluma.env`（600） |
+| supervisor 日志 | `/opt/snowluma/logs/snowluma-YYYY-MM-DD.log` + `supervisor.out` |
+| QQ 日志 | `/opt/snowluma/logs/qq.log` |
+| 配置 | `/opt/snowluma/config/{onebot.json,runtime.json}`（600） |
+| hook socket | `/opt/snowluma/run/`（`SNOWLUMA_HOOK_RUNTIME_DIR` 两侧必须一致） |
+
+### 首次扫码（无头机唯一需要人工的一步）
+
+二维码在 **QQ 自己的 X 窗口**里（SnowLuma 不代理登录，WebUI 的二维码只用于 2FA）：
+
+```bash
+# 1) /root/deploy/snowluma.env 里 SNOWLUMA_VNC="1"，重启容器
+./ops/snowluma/container/run.sh down && ./ops/snowluma/container/run.sh up
+# 2) 本机建隧道
+ssh -L 5900:127.0.0.1:5900 <user>@<SERVER_IP>
+# 3) VNC 客户端连 localhost:5900（无密码），用手机 QQ 扫码
+# 4) 登录成功后把 SNOWLUMA_VNC 改回 "0" 再重启（省 ~12MB 内存 + 少一个监听）
+```
+
+### 注入是否健康（不要只看进程在）
+
+```bash
+grep -E "hook auto-load|awaiting login|pipe connected" /opt/snowluma/logs/snowluma-$(date +%F).log | tail -3
+```
+
+正常应看到 `hook auto-load enabled` 与 `pipe connected: PID=…`；若出现
+`process enumeration failed`，说明宿主 glibc 又被用上了（不在容器里跑就会这样）。
+
+手动注入（自动注入关掉时）：WebUI → 进程 → 加载，或
+`POST /api/processes/<pid>/load`（先 `POST /api/login` 拿 token，带 `Authorization: Bearer`）。
+
+### 切换网关
+
+```bash
+# 改成 snowluma（容器）或 napcat（宿主 LD_PRELOAD）后重启守护
+sed -i 's/^export BOT_GATEWAY=.*/export BOT_GATEWAY="snowluma"/' /root/deploy/bot.env
+systemctl restart qqbot-watchdog
+```
+
+> 提醒：`/root/deploy/bot.env` 与 `/opt/snowluma/config/onebot.json` 的 WS token 必须同值，
+> 否则 Koishi 一直 401；`./ops/s0-verify.sh` 第 2、10 组会分别查两侧。

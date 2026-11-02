@@ -456,3 +456,198 @@ find /opt/snowluma -name 'wrapper*.node'               # 发行包里的仍在�
 > 路线 B 不是"少做验证"，而是**把验证拆成三次可回滚的窗口**：
 > W0 烧安装问题（零风险）、W1 烧注入/登录问题（15 分钟）、W2 烧协议行为问题（10 分钟）。
 > 而所有这些的前提，是 S0 里那两件看起来最无聊的事——**统一 token** 和 **写好一键回滚脚本**。
+
+---
+
+## 附录 A：容器化落地（2026-10-30 实测，取代第 0/2 章的源码构建路线）
+
+### A.1 为什么改写路线
+
+W0 按第 4 章直跑官方 release 包时，WebUI 能起（5099），但原生层每次都报：
+
+```
+[Hook] process enumeration failed: libstdc++.so.6: version `GLIBCXX_3.4.29' not found
+```
+
+实测门槛：`.node` 需 `GLIBCXX_3.4.29` + `GLIBC_2.32/2.33/2.34`，`.so` 需 `GLIBC_2.32/2.34`；
+宿主 Ubuntu 20.04 只有 2.31 / 3.4.28，**换 libstdc++ 无效**（缺的是 glibc）。
+因此不再走“源码构建/本地编译”，改为 **QQ + SnowLuma 同容器**（`ubuntu:24.04`，glibc 2.39）。
+第 0.1/0.3 节关于 fork 构建的讨论保留作背景，但当前不采用。
+
+### A.2 制品与目录
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `qqbot/snowluma:2.2.1`（从 `ops/snowluma/container/Dockerfile` 构建，不含 SnowLuma 本体） |
+| SnowLuma | 官方 release 包解压到 `/opt/snowluma`（自带 node 24.22.1） |
+| QQ | 宿主 `/opt/QQ` 直接挂进容器（与 NapCat 时代同一份） |
+| 登录态 | 宿主 `/root/.config/QQ`（可写挂载，尽量复用已登过的库） |
+| 运行时环境 | `/root/deploy/snowluma.env`（600，只读挂入） |
+
+状态分层靠 CWD：SnowLuma 的 `config/`、`data/`、`logs/` 都是相对工作目录的固定名，
+容器 `WORKDIR=/opt/snowluma`，于是代码与状态天然同层、可整目录备份。
+
+### A.3 运行时参数（每一项都有理由，别删）
+
+| 参数 | 为什么 |
+|---|---|
+| `--network host` | 3001/5099 继续走回环，Koishi 完全不用改 |
+| `--cap-add=SYS_PTRACE` | 注入是 ptrace + dlopen，不是 `LD_PRELOAD` |
+| `--security-opt seccomp=unconfined` | 默认 profile 拦 `process_vm_readv` |
+| `--shm-size=512m` | Electron 默认 64m 会崩渲染进程 |
+| `--stop-timeout 20` | entrypoint 要依次收 Xvfb/QQ/supervisor |
+| `--restart no` | 生命周期交给 watchdog，两个重启器会抢容器名 |
+| `SNOWLUMA_HOOK_RUNTIME_DIR` | 必须进 **QQ 进程 environ**（supervisor 先读目标进程的环境） |
+
+### A.4 OneBot 字段差异（照搬 NapCat 会静默不生效）
+
+| 含义 | NapCat | SnowLuma |
+|---|---|---|
+| 消息格式 | `messagePostFormat` | `messageFormat` |
+| 鉴权 | `token` | `accessToken` |
+| 容器键 | `network.websocketServers[]` | `networks.wsServers[]` |
+| 模式 | — | `mode: overlay`（全局）/`snapshot`（per-UIN） |
+
+配置文件：`/opt/snowluma/config/onebot.json`（全局，登录前即生效）+ `onebot_<uin>.json`（登录后按号覆盖）。
+本次只建全局一份，WS `127.0.0.1:3001`、`role: Universal`、`messageFormat: array`，
+不建 HTTP 服务端（少一个暴露面）。
+
+### A.5 容器下的 W0/W1 验收
+
+```bash
+# W0：只起 supervisor，不碰 QQ（SNOWLUMA_START_QQ=0）
+./ops/snowluma/container/run.sh up && ./ops/snowluma/container/run.sh status
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5099/      # 期望 200
+
+# W1：起 QQ + 自动注入（SNOWLUMA_START_QQ=1, SNOWLUMA_HOOK_AUTOLOAD=1）
+grep -E 'hook auto-load enabled|pipe connected' /opt/snowluma/logs/snowluma-$(date +%F).log
+```
+
+实测结果：W0 200；W1 出现 `hook auto-load enabled` + `pipe connected: PID=…`，
+`/api/processes` 返回 `injected:true, method:loadModuleManual`。
+**登录一步卡在平台侧风控（`serverErrorCode: 168`），不是技术链路问题。**
+
+### A.6 不再适用的步骤
+
+- 第 0.2/0.3 节的“本地编译 Node 24 / 打补丁重编” —— 当前用官方包，不改源码。
+- 第 4.4 节里“把端口改到 30xx 避开 NapCat” —— 容器模式下与 NapCat 互斥切换，端口直接用 3001。
+- 第 6.1 节改 watchdog 的 `start_napcat` —— 已实现为 `start_gateway` 互斥分支（napcat ↔ snowluma 容器）。
+
+---
+
+## 附录 B：SnowLuma 侧多账号（加第二个 QQ 号）
+
+### B.1 SnowLuma 官方支持形态（不是拼凑）
+
+| 事实 | 依据 |
+|---|---|
+| 一个 QQ 主进程 = 一个账号 = 一个独立 `OneBotInstance` | 官方「Docker 部署 · 多开 QQ（多账号）」 |
+| `HookManager` 遍历**所有** QQ 主进程，新起一个自动注入一个 | `packages/core/src/hook/hook-manager.ts` |
+| 配置按号落地：`config/onebot_<uin>.json` 覆盖全局 `config/onebot.json` | 官方「配置参考」 |
+| Linux QQ 单实例锁在 `$HOME/.config/QQ/SingletonLock` → **多开 = 每号一个 HOME** | 官方原文 |
+| 每号各自 bind 自己的 `wsServers` → **端口必须各用各的** | 「端口冲突」章节 |
+| `SNOWLUMA_EXTRA_QQ_HOMES` 只是**官方镜像**提供的便利变量 | 官方 Compose 模板 |
+
+结论：多账号能力在 SnowLuma 本体里，**不需要 fork、不需要改 QQ**。本项目自建镜像
+（`ops/snowluma/container/`）原先只写了单账号，缺口是"多 HOME 拉起 + 多 HOME 挂载"，
+已在 `entrypoint.sh`（`start_extra_qq`）与 `run.sh`（`EXTRA_MOUNTS`）补齐。
+
+### B.2 落地步骤（3 步 + 1 次扫码）
+
+```bash
+# 1) 宿主建独立 HOME（这就是第二个号的整个登录态所在，务必落在持久目录）
+mkdir -p /root/qq-acct2
+# 2) 写进 snowluma.env（run.sh 会逐个 -v 挂进容器，路径宿主=容器一致）
+sed -i 's|^export SNOWLUMA_EXTRA_QQ_HOMES=.*|export SNOWLUMA_EXTRA_QQ_HOMES="/root/qq-acct2"|' \
+  /root/deploy/snowluma.env
+# 3) entrypoint 改动是 COPY 进镜像的 → 必须重建，然后重建容器
+docker build -t qqbot/snowluma:2.2.1 /root/code/AgentTalk/ops/snowluma/container/
+/root/code/AgentTalk/ops/snowluma/container/run.sh up
+# 4) 扫码：两个 QQ 窗口都在同一个 Xvfb :99 里，VNC 进去分别扫
+/root/code/AgentTalk/ops/snowluma/container/run.sh status
+```
+
+验收（容器内）：
+
+```bash
+docker exec qqbot-snowluma ps -eo pid,args | grep '/opt/QQ/qq --no-sandbox' | grep -v grep
+# 期望两个主进程（各自的子进程是 --type=zygote，别数进去）
+grep -E 'hook auto-load enabled|pipe connected' /opt/snowluma/logs/snowluma-$(date +%F).log
+ls -l /opt/snowluma/config/onebot_*.json      # 登录后按号生成
+```
+
+**启用/停用开关**（只改一行，随时可退）：
+
+```bash
+# 启用
+sed -i 's|^export SNOWLUMA_EXTRA_QQ_HOMES=.*|export SNOWLUMA_EXTRA_QQ_HOMES="/root/qq-acct2"|' /root/deploy/snowluma.env
+# 停用（等于把第二个号摘掉；HOME 目录保留，登录态不丢）
+sed -i 's|^export SNOWLUMA_EXTRA_QQ_HOMES=.*|export SNOWLUMA_EXTRA_QQ_HOMES=""|' /root/deploy/snowluma.env
+run.sh up
+```
+
+**只验网关、不接 Koishi**（本次选择的路径）时，验收只看三样：
+`ss -lnt | grep 3002` 在监听、WebUI 账号列表出现第二个 UIN、
+日志有该 UIN 的 `OneBot` 实例启动行；**不需要改 Koishi 一个字节**。
+
+### B.3 必改：第二个号的 WS 端口
+
+全局 `onebot.json` 是 `mode: overlay`，会给**每个**账号下发 `wsServers[0].port = 3001`。
+两个号都 bind 3001 → 第二个必失败（官方「端口冲突」章节）。
+
+```bash
+# 登录后按号改：第二个号用 3002，token 沿用 NAPCAT_WS_TOKEN
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path('/opt/snowluma/config/onebot_<UIN2>.json')
+c = json.loads(p.read_text())
+c['networks']['wsServers'][0]['port'] = 3002
+c['networks']['wsServers'][0]['host'] = '127.0.0.1'
+p.write_text(json.dumps(c, ensure_ascii=False, indent=2))
+PY
+run.sh down && run.sh up      # 配置是启动时读的
+ss -lnt | grep -E ':3001|:3002'
+```
+
+### B.4 Koishi 侧的真相（别忽略这一步）
+
+- Koishi 的 `onebot` 适配器支持多实例（每个 bot 一个 `selfId` + 一个 endpoint），
+  但 `deepseek.js` 的状态键是
+  `${platform}:${guildId}:${channelId}:${userId}`，**不含 selfId**。
+- 因此两个号进**同一个群**会互相污染：`histories` 共享、`groupBuffer` 先到先得、
+  `activeUntil` 任一唤醒即点亮 → 双回复。这与附录 A 的约束 2 完全一致。
+- 可选处置：
+  1. **分群/分私聊对象**（零代码，最稳）；
+  2. 给键加 selfId（要迁移 `state/deepseek/histories.json`，21KB 历史会全失配）；
+  3. 第二个号交给别的机器人框架，不进 Koishi。
+
+### B.5 硬瓶颈：内存（先看这个再动手）
+
+实测（2026-10-30，容器运行中）：
+
+| 项 | 值 |
+|---|---|
+| 宿主总内存 | 1872 MB |
+| 当前 available | **141 MB** |
+| swap 已用 | 1594 MB / 4095 MB |
+| 容器 `qqbot-snowluma` | 411 MB（QQ 主进程 RSS ≈ 100 MB + 子进程 ≈ 250 MB + supervisor ≈ 190 MB） |
+
+官方口径是"每个 QQ 进程 300–500 MB，多开建议 `--shm-size` 提到 2GB"。
+本机 available 只有 141 MB，**第二个 Chromium 大概率要靠 swap 硬撑 → 卡顿、扫码超时、hook 掉线**。
+
+处置优先级：
+1. 升到 4G 内存（推荐，`P3-1` 早已记这条）；
+2. 暂时不升：把 `opengym` 容器停掉（≈36 MB，杯水车薪）+ 扩 swap 到 8G，仅作灰度验证；
+3. 什么都不做直接加号 → 不建议，风控 168 还没解，两个号一起扫更容易撞限流。
+
+### B.6 熔断
+
+| 触发 | 动作 |
+|---|---|
+| 第二号注入后 `pipe connected` 不出现 | 查 `/proc/<pid>/environ` 是否带 `SNOWLUMA_HOOK_RUNTIME_DIR` |
+| 两号都 bind 3001 | 改第二号 `onebot_<uin>.json` 端口（B.3），`run.sh down/up` |
+| 宿主 available < 200 MB 且 swap 抖动 | 停用第二号（把 `SNOWLUMA_EXTRA_QQ_HOMES` 置空 + `run.sh up`） |
+| 第二号登录又报 168 | 别连扫，按 `06-snowluma-todo.md` P0-1 处理 |
+
+> 一句话：**SnowLuma 侧多账号是"零配置"的，配置负担全在端口（3002）和 HOME（挂载）上；
+> 真正拦住你的是内存，不是功能。**

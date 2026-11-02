@@ -49,34 +49,69 @@ done
 
 # ---------- 4. 脱敏（防止手写文档带真实值）----------
 log "执行脱敏替换"
-DROP=$(mktemp)
 SELF_ID=""
-[ -r /root/deploy/bot.env ] && SELF_ID=$(grep -oP '(?<=^export NAPCAT_SELF_ID=")[^"]*' /root/deploy/bot.env || true)
-ADMINS=$([ -r /root/deploy/bot.env ] && grep -oP '(?<=^export BOT_ADMIN_USERS=")[^"]*' /root/deploy/bot.env || true)
-TOKEN=$([ -r /opt/napcat/config/webui.json ] && python3 -c "import json;print(json.load(open('/opt/napcat/config/webui.json')).get('token',''))" || true)
+ADMINS=""
+QUICK_LOGIN=""
+WS_TOKEN=""
+WEBUI_TOKEN=""
+if [ -r /root/deploy/bot.env ]; then
+  SELF_ID=$(grep -oP '(?<=^export NAPCAT_SELF_ID=")[^"]*' /root/deploy/bot.env || true)
+  ADMINS=$(grep -oP '(?<=^export BOT_ADMIN_USERS=")[^"]*' /root/deploy/bot.env || true)
+  QUICK_LOGIN=$(grep -oP '(?<=^export NAPCAT_QUICK_LOGIN=")[^"]*' /root/deploy/bot.env || true)
+  WS_TOKEN=$(grep -oP '(?<=^export NAPCAT_WS_TOKEN=")[^"]*' /root/deploy/bot.env || true)
+fi
+[ -r /opt/napcat/config/webui.json ] && \
+  WEBUI_TOKEN=$(python3 -c "import json;print(json.load(open('/opt/napcat/config/webui.json')).get('token',''))" 2>/dev/null || true)
 
-find . -path ./.git -prune -o -type f \
-     \( -name '*.md' -o -name '*.js' -o -name '*.json' -o -name '*.example' -o -name '*.sh' \) -print0 \
-| xargs -0 sed -i \
-    -e "s/${TOKEN:-@@NOPE@@}/<WEBUI_TOKEN>/g" \
-    -e "s/${SELF_ID:-@@NOPE@@}/<BOT_UIN>/g"
+# 逐个明文值 → 占位符（值均为字母数字，用 | 作分隔符即可）
+sanitize() {
+  local v=$1 ph=$2
+  [ -n "$v" ] || return 0
+  find . -path ./.git -prune -o -type f \
+       \( -name '*.md' -o -name '*.js' -o -name '*.json' -o -name '*.example' -o -name '*.sh' \) -print0 \
+  | xargs -0 sed -i "s|$v|$ph|g"
+}
+
+sanitize "$WEBUI_TOKEN" '<WEBUI_TOKEN>'
+sanitize "$WS_TOKEN"    '<WS_TOKEN>'
+
+# 文档里的 IPv4 一律占位化（本机 EIP 不在网卡上，自动探测不可靠，
+# 所以用“保护回环 → 全替 → 还原”的确定做法）
+log "文档 IPv4 → <SERVER_IP>"
+find . -path ./.git -prune -o -type f -name '*.md' -print0 \
+| xargs -0 sed -i -E \
+    -e 's/127\.0\.0\.1/@@LOOPBACK@@/g' \
+    -e 's/0\.0\.0\.0/@@ANYADDR@@/g' \
+    -e 's/::1/@@LOOP6@@/g' \
+    -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<SERVER_IP>/g' \
+    -e 's/@@LOOPBACK@@/127.0.0.1/g' \
+    -e 's/@@ANYADDR@@/0.0.0.0/g' \
+    -e 's/@@LOOP6@@/::1/g'
+if [ -n "$SELF_ID" ]; then sanitize "$SELF_ID" '<BOT_UIN>'; fi
+# 快速登录号通常就是机器人号；上面没换完的遗珠再扫一遍
+if [ -n "$QUICK_LOGIN" ] && [ "$QUICK_LOGIN" != "$SELF_ID" ]; then
+  sanitize "$QUICK_LOGIN" '<BOT_UIN>'
+fi
 
 if [ -n "$ADMINS" ]; then
   IFS=',' read -ra LIST <<< "$ADMINS"
   i=0
   for u in "${LIST[@]}"; do
     [ -z "$u" ] && continue
-    ph="<UIN$((++i))>"
-    sed -i "s/$u/$ph/g" $(grep -rl "$u" --include='*.md' . 2>/dev/null || true)
+    sanitize "$u" "<UIN$((++i))>"
   done
 fi
-rm -f "$DROP"
 
 # ---------- 5. 硬门槛：密钥扫描 ----------
-log "扫描密钥（必须为 0）"
-if grep -rInE 'sk-[A-Za-z0-9]{20,}|[0-9]{1,3}(\.[0-9]{1,3}){3}|"token"[[:space:]]*:[[:space:]]*"[0-9a-f]{8,}"' \
-     --exclude-dir=.git . ; then
-  fail "发现疑似密钥/IP，已中止。请修正后重跑。"
+# 闸门口径：sk- 密钥 / 公网 IP / 真 token 一律中止；
+# 127.0.0.1、0.0.0.0、::1 属回环与占位，放行（否则文档里每条 ws://127.0.0.1 都会误报）。
+log "扫描密钥与公网 IP（必须为 0）"
+HITS=$(grep -rInE 'sk-[A-Za-z0-9]{20,}|([0-9]{1,3}\.){3}[0-9]{1,3}|"token"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{8,}"' \
+         --exclude-dir=.git . 2>/dev/null || true)
+HITS=$(printf '%s\n' "$HITS" | grep -vE '127\.0\.0\.1|0\.0\.0\.0|::1|255\.255\.255\.255' || true)
+if [ -n "$HITS" ]; then
+  printf '%s\n' "$HITS" >&2
+  fail "发现疑似密钥 / 公网 IP / 真 token，已中止。修正后重跑。"
 fi
 log "扫描通过"
 

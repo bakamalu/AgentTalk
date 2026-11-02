@@ -474,3 +474,10 @@ cp -a /root/deploy/migrate/state-backup/deepseek /opt/koishi/state/
 > 迁移的真正工作量不在"换网关"，而在**把网关差异提前对齐（token/端口/报文格式）**
 > 和**用回归套件证明 19 项历史修复没有回归**。
 > S0 做完之后，切换本身只是"换个进程监听 3001"——而这件事 5 分钟内可以撤回。
+
+---
+
+> **2026-10-30 实测补充**：官方 release 包的原生层要 glibc ≥ 2.34
+> （`GLIBCXX_3.4.29` + `GLIBC_2.32/2.33/2.34`），宿主 Ubuntu 20.04（2.31）直跑会在
+> 进程枚举阶段失败。最终采用「QQ + SnowLuma 同容器（ubuntu:24.04）」落地，
+> 注入链路已跑通；细节见 `docs/03-dev-log.md` 第十七节与 `docs/04-migration-snowluma.md` 附录 A。
