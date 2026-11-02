@@ -50,7 +50,7 @@ scripts/botctl.sh gate            # ④ 收工前跑一次，39 项必须全绿
 | 仓库 | 线上执行副本 | 部署方式 |
 |---|---|---|
 | `bot/plugins/deepseek.js` | `/opt/koishi/plugins/deepseek.js` | `botctl.sh sync plugin` |
-| `bot/lib/*.js`（8 个模块） | `/opt/koishi/lib/` | 同上，`sync plugin` 会自动连带同步（11-02 前旧版**只 cp 一个文件**，拆模块后沿用会把线上部署成缺模块 → 插件加载失败） |
+| `bot/lib/*.js`（10 个模块，含 timers.js 定时提醒、members.js 平台无关成员解析） | `/opt/koishi/lib/` | 同上，`sync plugin` 会自动连带同步（11-02 前旧版**只 cp 一个文件**，拆模块后沿用会把线上部署成缺模块 → 插件加载失败） |
 | `ops/bot-watchdog.sh` | `/opt/bot-watchdog.sh` | `botctl.sh sync watchdog` |
 
 ---
@@ -59,7 +59,7 @@ scripts/botctl.sh gate            # ④ 收工前跑一次，39 项必须全绿
 
 | 改动对象 | 生效方式 | 不这么做的后果 |
 |---|---|---|
-| `BOT_SEARCH_*`、`BOT_WEATHER_*`、`BOT_QUOTE_REPLY`、敏感词等热配置 | 约 5s 自动重载，**不用重启** | 白重启一次 |
+| `BOT_SEARCH_*`、`BOT_WEATHER_*`、`BOT_QUOTE_REPLY`、`BOT_REMINDER_*`、敏感词等热配置 | 约 5s 自动重载，**不用重启** | 白重启一次 |
 | `bot.env` 里其余变量 | 需重启 Koishi，且必须验证进程真拿到了新值 | 改了但进程还是旧值 |
 | `bot/plugins/deepseek.js`（及 `bot/lib/`） | `botctl.sh sync plugin`（diff 确认 → `FORCE=1` → 逐文件备份+cp → `node --check` → 重启） | 跑的仍是旧代码（无软链！）；只 cp 主体不 cp lib 则 `Cannot find module` |
 | `snowluma.env` 的 `WEBUI_HOST` / `WEBUI_TLS` | 仅进程启动时读，**无热重载** → 重启容器 | 配置写了但没监听 |
@@ -182,6 +182,9 @@ ssh -L 5099:127.0.0.1:5099 root@<SERVER_IP>
 | 10 | 打开 WebUI 报 TLS 相关错误、页面完全起不来 | 开了 `webuiTls` 但没放证书 → `requireTlsContext()` 抛错 | 先 `cert.pem`+`key.pem`，再开开关 |
 | 11 | `start.sh` 静默 exit 1 且无输出 | 脚本里 `. /etc/profile`（20.04 宿主会让整个脚本以 1 退出，`\|\| true` 拦不住 profile 内部的 exit） | 显式给 `PATH/HOME/LANG`，不 source profile |
 | 12 | 改配置后 curl 自己的公网 IP 返回 000，误判"外网不通" | 阿里云 EIP 不支持 hairpin 回环 | 必须从**外部网络**实测，且受安全组控制 |
+| 13 | 设了定时提醒，到点却没叫（日志 `[提醒] 投递目标失效…`） | `reminders.json` 能恢复提醒表，但 **bot 连接不可序列化**；重启后若该会话没再发过消息，就 `registerTarget` 不上、拿不到 bot | 预期行为：目标失效会 60s 退避重试最多 3 次，期间该会话发任意一条消息即可续上；仍不行走 `#状态` 看"待触发 N 个"确认表还在 |
+| 14 | 同一条到点提醒被投两遍（日志同一 id、同一秒出现两行"主动消息已发"+"已触发"） | `tryTick` 在 `await fire(r)` **之后**才 `pending.delete`；await 让出窗口内并发的第二次 tryTick 又按 `status==='pending'` 捞到同一提醒 | 已在 `lib/timers.js` 修复：`tryTick` 改为**纯同步**的"快照→把到期项 `status` 改 `firing` 认领→`due.map(runFire)` 并发派发"，投递（含延迟代理轮）在各自 `runFire` 后台 await，不再阻塞调度、跨会话真正并发；同一提醒靠同步认领保证只派发一次，`createReminder` 也不再直调 `tryTick()`。回归见 `scripts/smoke-timers.js` 用例 #12/#13 |
+| 15 | 想“到点@某个昵称的人”却只 @ 到了自己 | 旧版 @ 只认“5~12 位纯数字”且只当 QQ；昵称一律被丢弃 | 现 `set_reminder` 支持 `at_user_names`，走 `lib/members.js` 的 Satori 抽象 `getGuildMemberList` 查成不透明 userId（非 QQ 专用）；查不到/多人同名会回告模型去向用户要 ID |
 
 还有两条属于"设计上的残余风险"，不是 bug 但要知道：
 

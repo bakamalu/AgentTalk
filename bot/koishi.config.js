@@ -38,6 +38,14 @@ module.exports = {
       // 拦截通知：1=当前会话发提示；空=仅记日志
       sensitiveNotify: process.env.BOT_SENSITIVE_NOTIFY || '',
       quoteReply: process.env.BOT_QUOTE_REPLY || '',
+      // 定时提醒（lib/timers.js）：空 = 插件内置默认（开）；有值 = 按此。BOT_REMINDER_* 也支持改 bot.env 热生效
+      reminderEnabled: process.env.BOT_REMINDER_ENABLED || '',
+      reminderMaxPerChat: process.env.BOT_REMINDER_MAX_PER_CHAT || '',
+      reminderMaxTotal: process.env.BOT_REMINDER_MAX_TOTAL || '',
+      reminderMaxDelayS: process.env.BOT_REMINDER_MAX_DELAY_S || '',
+      reminderAtRequester: process.env.BOT_REMINDER_AT_REQUESTER || '',
+      reminderMaxAt: process.env.BOT_REMINDER_MAX_AT || '',
+      reminderExec: process.env.BOT_REMINDER_EXEC || '',
       // 状态目录（历史/用量落盘）
       stateDir: process.env.BOT_STATE_DIR || '',
       // QQ 内管理员（特权指令）：空 = 无管理员；有值 = 仅名单内

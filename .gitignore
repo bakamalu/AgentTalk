@@ -40,6 +40,10 @@ node_modules/
 .pnpm-store/
 dist/
 lib/
+# 例外：bot/lib/ 是插件共享源码模块（非构建产物），必须纳入版本控制；
+# 不修正则 hotconfig/sender/tools/timers 等全部不进 git（见 OPS-NOTES §1 sync 说明）
+!bot/lib/
+!bot/lib/*.js
 *.tsbuildinfo
 
 # ============================================================

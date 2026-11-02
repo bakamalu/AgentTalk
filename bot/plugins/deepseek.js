@@ -9,6 +9,7 @@
 //   lib/sender.js     频率闸 + 投递路由（群走 send_group_msg，引用走 reply 段）
 //   lib/quote.js      引用原文三层兜底（adapter → internal.getMsg → 直连 WS）
 //   lib/tools.js      工具注册表：能力在这里挂载与分发
+//   lib/timers.js     定时提醒（到点可 @ 指定人）：提醒表/持久化/到点调度
 //   lib/weather.js    天气（Open-Meteo 免 key，兜底 wttr.in）
 //   lib/websearch.js  联网搜索（Bing 免 key + 查询词治理 + 结果质量闸）
 //
@@ -21,6 +22,7 @@ const storeLib = require('../lib/store');
 const senderLib = require('../lib/sender');
 const quoteLib = require('../lib/quote');
 const toolsLib = require('../lib/tools');
+const timersLib = require('../lib/timers');
 
 const { DEFAULTS } = hotconfig;
 
@@ -61,8 +63,66 @@ module.exports = (ctx, config = {}) => {
       splitMaxParts: config.splitMaxParts,
     },
   });
-  const { send: sendReply, allowSend } = sender;
-  const hub = toolsLib.create({ logger, hot });
+  const { send: sendReply, allowSend, notify } = sender;
+  // ---------- 定时提醒（lib/timers.js）----------
+  // 到点默认走「完整延迟代理轮」：把这条提醒当指令，经 enqueue(chatKey) 与该会话实时消息串行，
+  // 重跑 callDeepSeek+工具，真的去查天气/搜索/@人，再把结果用 sender.notify 投出去（群可 @）。
+  // BOT_REMINDER_EXEC=0 时退回便宜的固定文案投递。onFire 返回 false=投递结果未知，由 timers 放弃不重发。
+  const timers = timersLib.create({
+    stateDir,
+    logger,
+    hot,
+    readJson: store.readJson,
+    writeJson: store.writeJson,
+    onFire: async ({ reminder, chatKey, target, text, atUserIds }) => {
+      // 便宜模式：只投固定文案，不消耗 token
+      if (!hot.reminderExec) {
+        const ok = await notify(target, text, { atUserIds });
+        if (ok) { pushHistory(chatKey, 'assistant', text, null); scheduleSave(); }
+        return ok;
+      }
+      // 完整延迟代理轮：与同会话实时消息串行，避免上下文交错
+      return enqueue(chatKey, async () => {
+        const history = getHistory(chatKey);
+        const atDesc = atUserIds.length
+          ? `到点需要 @ 这些用户：${atUserIds.join('、')}（系统会自动替你 @ 到人，正文里不要把 ID 再写一遍）。`
+          : '';
+        const instr = `[定时提醒到点] 现在到了你 ${timersLib.fmtTime(reminder.createdAt)} 记下的这条待办的触发时刻（原定 ${timersLib.fmtDateTime(reminder.dueAt)}）。待办：「${reminder.note}」。\n`
+          + '请现在完成它并把结果发到本会话：需要查天气/搜索/看实时信息的，就调用相应工具拿最新结果再回答；只是叫用户做某件日常小事的，就直接简短提醒一句、不要调工具。' + atDesc + '\n'
+          + '⚠ 现在不是设表时机，绝对不要新建/取消/列出提醒；也不要谎称之前已经提醒过。';
+        const messages = [
+          { role: 'system', content: `${hot.systemPrompt}\n${timeLine()}\n${toolsLib.describeCapabilities(hot)}` },
+          ...history.map(({ role, content, senderId }) => ({
+            role,
+            content: role === 'user' && senderId ? '[用户 ' + senderId + '] ' + content : content,
+          })),
+          { role: 'user', content: instr },
+        ];
+        let reply;
+        try {
+          // 本轮排除提醒类工具：防止“执行任务”时又去 set_reminder 造成递归。
+          const result = await callDeepSeek(messages,
+            { chatKey, userId: String(reminder.userId || '') },
+            { excludeTools: ['set_reminder', 'list_reminders', 'cancel_reminder'] });
+          reply = result.text;
+          recordUsage(chatKey, result.usage);
+        } catch (error) {
+          logger.warn(`[提醒] 延迟代理轮失败，降级为固定文案 ${reminder.id}: ${String(error?.message || error).slice(0, 120)}`);
+          reply = text; // 兜底：至少把“到点叫你了”投出去
+        }
+        if (hitSensitive(reply)) reply = text; // 输出命中敏感词：退回中性固定文案
+        const ok = await notify(target, reply, { atUserIds });
+        if (ok) {
+          pushHistory(chatKey, 'user', `[定时提醒到点] ${reminder.note}`, null, String(reminder.userId || ''));
+          pushHistory(chatKey, 'assistant', reply, null);
+          scheduleSave();
+          logger.info(`[提醒] 到点执行完成 ${reminder.id} → ${reply.replace(/\s+/g, ' ').slice(0, 80)}`);
+        }
+        return ok;
+      });
+    },
+  });
+  const hub = toolsLib.create({ logger, hot, timers });
   const quotes = quoteLib.create({
     logger,
     wsEndpoint: config.napcatWsEndpoint || process.env.NAPCAT_WS_ENDPOINT || 'ws://127.0.0.1:3001',
@@ -123,6 +183,7 @@ module.exports = (ctx, config = {}) => {
   logger.info(`[敏感词] ${hot.sensitiveWords.length ? hot.sensitiveWords.length + ' 个词已启用' : '未启用'}；引用回复 ${hot.quoteReply ? '开' : '关'}`);
   logger.info(`[搜索] 联网搜索 ${hot.searchEnabled ? `开（Bing，最多 ${hot.searchMaxRounds} 轮 × ${hot.searchMaxResults} 条，含查询词归一化+质量闸）` : '关（模型会被告知自己不能联网）'}`);
   logger.info(`[天气] ${hot.weatherEnabled ? `开（Open-Meteo 主 + wttr.in 兜底；默认城市 ${hot.weatherDefaultCity || '未设置=向用户追问'}）` : '关（天气类问题会被告知查不到）'}`);
+  logger.info(`[提醒] ${hot.reminderEnabled ? `开（到点${hot.reminderExec ? '重跑模型+工具真的执行任务' : '仅发固定文案'}；单会话≤${hot.reminderMaxPerChat}个、最长${Math.round(hot.reminderMaxDelayS / 3600)}h；群聊默认@设表人、@上限${hot.reminderMaxAt}人）` : '关（用户要求定时提醒会被告知叫不了）'}${timers.loadedInfo.kept ? `；已从磁盘恢复 ${timers.loadedInfo.kept} 个待触发` : ''}`);
   logger.info(`[上下文] @前群聊上下文 ${hot.groupContextMax > 0 ? `最近 ${hot.groupContextMax} 条/${Math.round(hot.groupContextMs / 1000)}s` : '关'}；@后免@活跃窗口 ${hot.activeWindowMs > 0 ? Math.round(hot.activeWindowMs / 1000) + 's' : '关'}`);
   logger.info(`[模式] ${hot.atOnly ? '严格@（群里只有被@才回应）' : '常规（@/关键词/引用/活跃窗口）'}；连发合并 ${hot.mergeWindowMs > 0 ? Math.round(hot.mergeWindowMs / 1000) + 's' : '关'}；mentionOnly=${mentionOnly}`);
   logger.info(`[状态] 目录 ${stateDir}（历史 ${histories.size} 个会话已恢复；${usageSummary()}）`);
@@ -229,7 +290,7 @@ module.exports = (ctx, config = {}) => {
   };
 
   // ---------- 模型调用：带工具往返的多轮循环 ----------
-  const callDeepSeek = async (messages) => {
+  const callDeepSeek = async (messages, execCtx = {}, opts = {}) => {
     let working = messages;
     const usage = { prompt_tokens: 0, completion_tokens: 0 };
     const searched = [];
@@ -237,7 +298,7 @@ module.exports = (ctx, config = {}) => {
 
     for (;;) {
       // 最后一轮不再下发 tools，强制模型基于已拿到的内容给出文字答案，防止无限循环。
-      const tools = round < hot.searchMaxRounds ? hub.schemas() : [];
+      const tools = round < hot.searchMaxRounds ? hub.schemas(opts.excludeTools) : [];
       const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -282,7 +343,7 @@ module.exports = (ctx, config = {}) => {
         const name = call.function?.name || 'web_search';
         let result;
         try {
-          result = await hub.exec(name, call.function?.arguments);
+          result = await hub.exec(name, call.function?.arguments, execCtx);
         } catch (error) {
           // 工具本身异常不能让整轮崩掉：把失败如实交给模型，要求它说查不到
           const message = String(error?.message || error).slice(0, 120);
@@ -333,6 +394,7 @@ module.exports = (ctx, config = {}) => {
         sender.rateDesc(),
         `图片识别：${hot.enableImage ? `开（单条最多 ${hot.imageMax} 张，base64 内联）` : '关'}`,
         `联网能力：搜索 ${hot.searchEnabled ? `开（${hot.searchMaxRounds} 轮 × ${hot.searchMaxResults} 条）` : '关'}；天气 ${hot.weatherEnabled ? `开（默认城市 ${hot.weatherDefaultCity || '无'}）` : '关'}`,
+        `定时提醒：${hot.reminderEnabled ? `开，待触发 ${timers.pendingCount()} 个（${hot.reminderExec ? '到点重跑模型执行任务' : '到点仅发固定文案'}；群聊默认@设表人，@上限 ${hot.reminderMaxAt} 人，单会话≤${hot.reminderMaxPerChat} 个）` : '关'}`,
         `热重载：${botEnvFile}（2~5 秒自动生效，无需重启）`,
         `当前人格：${hot.systemPrompt.slice(0, 40)}`,
       ];
@@ -458,13 +520,13 @@ module.exports = (ctx, config = {}) => {
       { role: 'system', content: `${hot.systemPrompt}\n${timeLine()}\n${toolsLib.describeCapabilities(hot)}` },
       ...history.map(({ role, content, senderId }) => ({
         role,
-        content: role === 'user' && senderId ? '[QQ号 ' + senderId + '] ' + content : content,
+        content: role === 'user' && senderId ? '[用户 ' + senderId + '] ' + content : content,
       })),
       { role: 'user', content: currentContent },
     ];
 
     try {
-      const result = await callDeepSeek(messages);
+      const result = await callDeepSeek(messages, { chatKey, userId: String(session.userId ?? '') });
       const badWord = hitSensitive(result.text);
       if (badWord) {
         logger.info(`[敏感词] 输出命中「${badWord}」，回复已拦截（${chatKey}）`);
@@ -520,6 +582,10 @@ module.exports = (ctx, config = {}) => {
     quotes.maybePatchGetMessage(session);
 
     maybeReload();
+
+    // 每条消息（含未唤醒的）都续一遍投递目标：定时提醒到点时靠它找回“发到哪个会话、用哪个 bot 连接”，
+    // 尤其重启后——只有收到该会话新消息才能重新拿到 bot 对象（见 lib/timers.js 说明）
+    timers.registerTarget(chatKeyOf(session), session);
 
     const rawText = normalizeText(session.content || '');
 
