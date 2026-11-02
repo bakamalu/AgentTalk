@@ -27,6 +27,14 @@ const DEFAULTS = {
   REMINDER_MAX_TOTAL: 200,     // 全进程待触发提醒总量上限
   REMINDER_MAX_DELAY_S: 86400, // 最长可预约时长（秒）
   REMINDER_MAX_AT: 5,          // 到点一条提醒最多 @ 几个人（防刷群）
+  // 大型任务校验（纯对话级轻量拦截，见 plugins/deepseek.js flushBucket）：
+  //   不看字数，看「构建意图」——命中【动作+对象】组合（如“编写…程序”“做个…游戏”），
+  //   或命中整段大工程短语（如“整个项目”“从零开始”），就玩笑回绝、不进模型，避免把 token 烧穿。
+  //   动作/对象/短语三张表都可热改；误伤时用户换个说法或关掉 BOT_BIGTASK_GUARD 即可。
+  BIGTASK_ACTIONS: ['写', '编写', '开发', '实现', '搭建', '生成', '制作', '做', '构建', '造'],
+  BIGTASK_OBJECTS: ['程序', '游戏', '软件', '系统', '网站', '网页', 'app', '小程序', '客户端', '后台', '平台', '框架', '引擎', '源码', '源代码', '脚本', '机器人', '外挂', '操作系统', '数据库'],
+  BIGTASK_KEYWORDS: ['整个项目', '一整个项目', '一整套', '全套系统', '一套完整', '完整的系统', '完整的软件', '从零开始', '从0到1', '重构整个'],
+  BIGTASK_REPLY: '你在开玩笑吗，做不到哈哈',
 };
 
 // 名单：空 = null（语义是“不限制”，不是“全部拒绝”）
@@ -64,6 +72,7 @@ const HOT_KEYS = [
   'BOT_REMINDER_ENABLED', 'BOT_REMINDER_MAX_PER_CHAT', 'BOT_REMINDER_MAX_TOTAL',
   'BOT_REMINDER_MAX_DELAY_S', 'BOT_REMINDER_AT_REQUESTER', 'BOT_REMINDER_MAX_AT',
   'BOT_REMINDER_EXEC',
+  'BOT_BIGTASK_GUARD', 'BOT_BIGTASK_ACTIONS', 'BOT_BIGTASK_OBJECTS', 'BOT_BIGTASK_KEYWORDS', 'BOT_BIGTASK_REPLY',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -100,6 +109,8 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_REMINDER_MAX_TOTAL: config.reminderMaxTotal, BOT_REMINDER_MAX_DELAY_S: config.reminderMaxDelayS,
       BOT_REMINDER_AT_REQUESTER: config.reminderAtRequester, BOT_REMINDER_MAX_AT: config.reminderMaxAt,
       BOT_REMINDER_EXEC: config.reminderExec,
+      BOT_BIGTASK_GUARD: config.bigTaskGuard, BOT_BIGTASK_ACTIONS: config.bigTaskActions,
+      BOT_BIGTASK_OBJECTS: config.bigTaskObjects, BOT_BIGTASK_KEYWORDS: config.bigTaskKeywords, BOT_BIGTASK_REPLY: config.bigTaskReply,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -148,6 +159,13 @@ const create = ({ config, logger, botEnvFile }) => {
     // 到点是否走「完整延迟代理轮」（重跑模型+工具真的去执行任务）；关掉则退回便宜的固定文案投递。
     // 默认开（与 reminderEnabled 同口径：空=开）。
     hot.reminderExec = pick('BOT_REMINDER_EXEC') === '' ? true : truthy(pick('BOT_REMINDER_EXEC'));
+    // 大型任务校验：默认开（空=开）。不看字数，只看「构建意图」（动作+对象 / 大工程短语），命中即回绝、不进模型省 token。
+    // 关掉后一切请求照常进模型；误伤时让用户换个说法或管理员关掉此闸即可。
+    hot.bigTaskGuard = pick('BOT_BIGTASK_GUARD') === '' ? true : truthy(pick('BOT_BIGTASK_GUARD'));
+    hot.bigTaskActions = pick('BOT_BIGTASK_ACTIONS') === '' ? DEFAULTS.BIGTASK_ACTIONS.slice() : toWordList(pick('BOT_BIGTASK_ACTIONS'));
+    hot.bigTaskObjects = pick('BOT_BIGTASK_OBJECTS') === '' ? DEFAULTS.BIGTASK_OBJECTS.slice() : toWordList(pick('BOT_BIGTASK_OBJECTS'));
+    hot.bigTaskKeywords = pick('BOT_BIGTASK_KEYWORDS') === '' ? DEFAULTS.BIGTASK_KEYWORDS.slice() : toWordList(pick('BOT_BIGTASK_KEYWORDS'));
+    hot.bigTaskReply = pick('BOT_BIGTASK_REPLY') || DEFAULTS.BIGTASK_REPLY;
     return true;
   };
 

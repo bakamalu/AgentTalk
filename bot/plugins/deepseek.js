@@ -161,6 +161,24 @@ module.exports = (ctx, config = {}) => {
   };
 
   const hitSensitive = (text) => hot.sensitiveWords.find((w) => String(text).includes(w));
+  // 大型任务校验：不看字数，看「构建意图」。命中就玩笑回绝，不进模型、不烧 token。
+  // 维度一（主力）：同时出现【动作】+【构建对象】——如“编写…程序”“做个…游戏”“开发…网站”，
+  //   两个都得中才算，避免“我在玩游戏”“帮我写个请假条”这类单边命中误伤。
+  // 维度二（兑底）：整段大工程短语（“整个项目”“从零开始”等），命中一个即可。
+  // 纯启发式、非语义理解；误伤时用户换个说法或管理员关掉 BOT_BIGTASK_GUARD 即可。返回命中原因（写日志），空串放行。
+  const bigTaskReason = (text) => {
+    const t = String(text || '');
+    if (!t) return '';
+    const lower = t.toLowerCase();
+    const phrase = hot.bigTaskKeywords.find((w) => w && lower.includes(String(w).toLowerCase()));
+    if (phrase) return `大工程短语「${phrase}」`;
+    const act = hot.bigTaskActions.find((w) => w && t.includes(w));
+    if (act) {
+      const obj = hot.bigTaskObjects.find((w) => w && lower.includes(String(w).toLowerCase()));
+      if (obj) return `构建意图「${act}…${obj}」`;
+    }
+    return '';
+  };
   // 拦截通知策略：BOT_SENSITIVE_NOTIFY=1 当前会话发提示；空 = 仅记日志（参考 qq-bridge）
   const censorNotify = (session, messageId) => {
     if (hot.sensitiveNotify) {
@@ -184,6 +202,7 @@ module.exports = (ctx, config = {}) => {
   logger.info(`[搜索] 联网搜索 ${hot.searchEnabled ? `开（Bing，最多 ${hot.searchMaxRounds} 轮 × ${hot.searchMaxResults} 条，含查询词归一化+质量闸）` : '关（模型会被告知自己不能联网）'}`);
   logger.info(`[天气] ${hot.weatherEnabled ? `开（Open-Meteo 主 + wttr.in 兜底；默认城市 ${hot.weatherDefaultCity || '未设置=向用户追问'}）` : '关（天气类问题会被告知查不到）'}`);
   logger.info(`[提醒] ${hot.reminderEnabled ? `开（到点${hot.reminderExec ? '重跑模型+工具真的执行任务' : '仅发固定文案'}；单会话≤${hot.reminderMaxPerChat}个、最长${Math.round(hot.reminderMaxDelayS / 3600)}h；群聊默认@设表人、@上限${hot.reminderMaxAt}人）` : '关（用户要求定时提醒会被告知叫不了）'}${timers.loadedInfo.kept ? `；已从磁盘恢复 ${timers.loadedInfo.kept} 个待触发` : ''}`);
+  logger.info(`[大任务校验] ${hot.bigTaskGuard ? `开（命中【动作+对象】如“编写…程序”/“做个…游戏”，或大工程短语即玩笑回绝、不进模型；动作${hot.bigTaskActions.length}词/对象${hot.bigTaskObjects.length}词/短语${hot.bigTaskKeywords.length}条；命中回复「${hot.bigTaskReply}」）` : '关（一切请求照常进模型）'}`);
   logger.info(`[上下文] @前群聊上下文 ${hot.groupContextMax > 0 ? `最近 ${hot.groupContextMax} 条/${Math.round(hot.groupContextMs / 1000)}s` : '关'}；@后免@活跃窗口 ${hot.activeWindowMs > 0 ? Math.round(hot.activeWindowMs / 1000) + 's' : '关'}`);
   logger.info(`[模式] ${hot.atOnly ? '严格@（群里只有被@才回应）' : '常规（@/关键词/引用/活跃窗口）'}；连发合并 ${hot.mergeWindowMs > 0 ? Math.round(hot.mergeWindowMs / 1000) + 's' : '关'}；mentionOnly=${mentionOnly}`);
   logger.info(`[状态] 目录 ${stateDir}（历史 ${histories.size} 个会话已恢复；${usageSummary()}）`);
@@ -395,6 +414,7 @@ module.exports = (ctx, config = {}) => {
         `图片识别：${hot.enableImage ? `开（单条最多 ${hot.imageMax} 张，base64 内联）` : '关'}`,
         `联网能力：搜索 ${hot.searchEnabled ? `开（${hot.searchMaxRounds} 轮 × ${hot.searchMaxResults} 条）` : '关'}；天气 ${hot.weatherEnabled ? `开（默认城市 ${hot.weatherDefaultCity || '无'}）` : '关'}`,
         `定时提醒：${hot.reminderEnabled ? `开，待触发 ${timers.pendingCount()} 个（${hot.reminderExec ? '到点重跑模型执行任务' : '到点仅发固定文案'}；群聊默认@设表人，@上限 ${hot.reminderMaxAt} 人，单会话≤${hot.reminderMaxPerChat} 个）` : '关'}`,
+        `大任务校验：${hot.bigTaskGuard ? `开（命中【动作+对象】如“编写…程序”/“做个…游戏”，或大工程短语即玩笑回绝、不进模型）` : '关'}`,
         `热重载：${botEnvFile}（2~5 秒自动生效，无需重启）`,
         `当前人格：${hot.systemPrompt.slice(0, 40)}`,
       ];
@@ -452,6 +472,15 @@ module.exports = (ctx, config = {}) => {
 
     // 合并正文 / 图片 / @前上下文
     const texts = items.map((it) => it.body).filter(Boolean);
+    // 大型任务校验：放在图片下载/模型调用之前，命中直接回绝，连抓取和 token 都省掉。
+    if (hot.bigTaskGuard) {
+      const reason = bigTaskReason(texts.join('\n'));
+      if (reason) {
+        logger.info(`[大任务] ${session.userId} 请求判为大型任务(${reason})，已回绝未进模型（${chatKey}）`);
+        try { await sendReply(session, hot.bigTaskReply, session.messageId); } catch (_) { /* 忽略 */ }
+        return;
+      }
+    }
     const imageUrls = [];
     for (const it of items) for (const u of it.imageUrls || []) if (u && !imageUrls.includes(u)) imageUrls.push(u);
 

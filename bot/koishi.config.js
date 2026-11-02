@@ -46,6 +46,12 @@ module.exports = {
       reminderAtRequester: process.env.BOT_REMINDER_AT_REQUESTER || '',
       reminderMaxAt: process.env.BOT_REMINDER_MAX_AT || '',
       reminderExec: process.env.BOT_REMINDER_EXEC || '',
+      // 大型任务校验（按构建意图拦截，不看字数）：空 = 插件内置默认（开）；0 = 关。BOT_BIGTASK_* 也支持改 bot.env 热生效
+      bigTaskGuard: process.env.BOT_BIGTASK_GUARD || '',
+      bigTaskActions: process.env.BOT_BIGTASK_ACTIONS || '',
+      bigTaskObjects: process.env.BOT_BIGTASK_OBJECTS || '',
+      bigTaskKeywords: process.env.BOT_BIGTASK_KEYWORDS || '',
+      bigTaskReply: process.env.BOT_BIGTASK_REPLY || '',
       // 状态目录（历史/用量落盘）
       stateDir: process.env.BOT_STATE_DIR || '',
       // QQ 内管理员（特权指令）：空 = 无管理员；有值 = 仅名单内
