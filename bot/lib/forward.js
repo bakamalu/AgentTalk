@@ -44,7 +44,7 @@ const segText = (content) => {
 // 从一个子节点里挖嵌套转发的 id（有则递归展开一层）
 const nestedForwardId = (content) => {
   if (typeof content === 'string') {
-    const m = content.match(/\[CQ:forward[^\]]*id=(-?\d+)/i) || content.match(/\[forward[^\]]*id=(-?\d+)/i);
+    const m = content.match(/\[CQ:forward[^\]]*id=([^,\]\s]+)/i) || content.match(/\[forward[^\]]*id=([^,\]\s]+)/i);
     return m ? m[1] : '';
   }
   if (Array.isArray(content)) {
@@ -163,8 +163,8 @@ const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001', seg
       }
     }
     const src = String(session.original || session.content || '');
-    const m = src.match(/\[CQ:forward[^\]]*id=(-?\d+)/i) || src.match(/\[forward[^\]]*id=(-?\d+)/i);
-    return m ? m[1] : '';
+    const m = src.match(/\[CQ:forward[^\]]*id=([^,\]\s]+)/i) || src.match(/\[forward[^\]]*id=([^,\]\s]+)/i);
+    return m && m[1] !== '-1' ? m[1] : '';
   };
 
   // 从一条 get_msg 返回体里挖 forward 段 id（字符串 raw_message 或 segment 数组两种形态都兼容）
@@ -172,7 +172,7 @@ const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001', seg
     if (!data) return '';
     const raw = data.raw_message || (typeof data.message === 'string' ? data.message : '');
     if (raw) {
-      const m = String(raw).match(/\[CQ:forward[^\]]*id=(-?\d+)/i) || String(raw).match(/\[forward[^\]]*id=(-?\d+)/i);
+      const m = String(raw).match(/\[CQ:forward[^\]]*id=([^,\]\s]+)/i) || String(raw).match(/\[forward[^\]]*id=([^,\]\s]+)/i);
       if (m && m[1] !== '-1') return m[1];
     }
     if (Array.isArray(data.message)) {
@@ -201,6 +201,7 @@ const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001', seg
     }
     const id = extractForwardId(data);
     if (id) logger.info(`[转发] 被引用消息 ${msgId} 是转发卡片 forwardId=${id}`);
+    else if (data) logger.info(`[转发] 被引用消息 ${msgId} 未识别出 forward id（get_msg keys=${Object.keys(data).join('/')} message=${Array.isArray(data.message) ? 'array' : typeof data.message}），跳过展开`);
     return id;
   };
 
