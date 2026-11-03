@@ -20,12 +20,17 @@ const decodeEntities = (s) => String(s)
 const cleanFragment = (s) => decodeEntities(String(s).replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
 
 // CQ 码 / 富文本标签 → 人可读的纯文本占位
+// 转发卡片（合并聊天记录）先整体换成占位，正文里不留 id 等脏数据；
+// 其真实内容由 lib/forward.js 另外拉取展开（这里只负责把“正文”洗干净）。
 const normalizeText = (text = '') => String(text)
   .replace(/\[CQ:image[^\]]*\]/gi, '[图片]')
   .replace(/\[CQ:record[^\]]*\]/gi, '[语音]')
   .replace(/\[CQ:video[^\]]*\]/gi, '[视频]')
   .replace(/\[CQ:face[^\]]*\]/gi, '[表情]')
   .replace(/\[CQ:at[^\]]*\]/gi, ' ')
+  .replace(/\[CQ:forward[^\]]*\]/gi, '[聊天记录]')
+  .replace(/\[CQ:node[^\]]*\]/gi, '')
+  .replace(/\[(?:forward|node)\b[^\]]*\]/gi, (m) => (/id=/i.test(m) ? '[聊天记录]' : ''))
   .replace(/<[^>]+>/g, '')
   .replace(/[ \t]{2,}/g, ' ')
   .trim();

@@ -42,6 +42,12 @@ const DEFAULTS = {
   BIGTASK_OBJECTS: ['程序', '游戏', '软件', '系统', '网站', '网页', 'app', '小程序', '客户端', '后台', '平台', '框架', '引擎', '源码', '源代码', '脚本', '机器人', '外挂', '操作系统', '数据库'],
   BIGTASK_KEYWORDS: ['整个项目', '一整个项目', '一整套', '全套系统', '一套完整', '完整的系统', '完整的软件', '从零开始', '从0到1', '重构整个'],
   BIGTASK_REPLY: '你在开玩笑吗，做不到哈哈',
+  // 转发（合并转发的聊天记录卡片）内容展开（见 lib/forward.js）：默认开。
+  //   收到 type=forward 段时，拉子消息渲染成可读文本喂给模型；嵌套深度/节点数/总字数都有上限防爆 token。
+  FORWARD_ENABLED: true,
+  FORWARD_MAX_NODES: 60,   // 单条转发最多展开多少条子消息
+  FORWARD_MAX_CHARS: 4000, // 渲染文本块总字数上限
+  FORWARD_MAX_DEPTH: 2,    // 嵌套转发递归深度上限
 };
 
 // 名单：空 = null（语义是“不限制”，不是“全部拒绝”）
@@ -80,6 +86,7 @@ const HOT_KEYS = [
   'BOT_REMINDER_MAX_DELAY_S', 'BOT_REMINDER_AT_REQUESTER', 'BOT_REMINDER_MAX_AT',
   'BOT_REMINDER_EXEC',
   'BOT_BIGTASK_GUARD', 'BOT_BIGTASK_ACTIONS', 'BOT_BIGTASK_OBJECTS', 'BOT_BIGTASK_KEYWORDS', 'BOT_BIGTASK_REPLY',
+  'BOT_FORWARD_ENABLED', 'BOT_FORWARD_MAX_NODES', 'BOT_FORWARD_MAX_CHARS', 'BOT_FORWARD_MAX_DEPTH',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -118,6 +125,8 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_REMINDER_EXEC: config.reminderExec,
       BOT_BIGTASK_GUARD: config.bigTaskGuard, BOT_BIGTASK_ACTIONS: config.bigTaskActions,
       BOT_BIGTASK_OBJECTS: config.bigTaskObjects, BOT_BIGTASK_KEYWORDS: config.bigTaskKeywords, BOT_BIGTASK_REPLY: config.bigTaskReply,
+      BOT_FORWARD_ENABLED: config.forwardEnabled, BOT_FORWARD_MAX_NODES: config.forwardMaxNodes,
+      BOT_FORWARD_MAX_CHARS: config.forwardMaxChars, BOT_FORWARD_MAX_DEPTH: config.forwardMaxDepth,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -178,6 +187,11 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.bigTaskObjects = pick('BOT_BIGTASK_OBJECTS') === '' ? DEFAULTS.BIGTASK_OBJECTS.slice() : toWordList(pick('BOT_BIGTASK_OBJECTS'));
     hot.bigTaskKeywords = pick('BOT_BIGTASK_KEYWORDS') === '' ? DEFAULTS.BIGTASK_KEYWORDS.slice() : toWordList(pick('BOT_BIGTASK_KEYWORDS'));
     hot.bigTaskReply = pick('BOT_BIGTASK_REPLY') || DEFAULTS.BIGTASK_REPLY;
+    // 转发内容展开：默认开（空=开）；三个上限都钳在合理区间，避免把 token 烧穿。
+    hot.forwardEnabled = pick('BOT_FORWARD_ENABLED') === '' ? true : truthy(pick('BOT_FORWARD_ENABLED'));
+    hot.forwardMaxNodes = Math.min(200, Math.max(1, numOr('BOT_FORWARD_MAX_NODES', DEFAULTS.FORWARD_MAX_NODES) || DEFAULTS.FORWARD_MAX_NODES));
+    hot.forwardMaxChars = Math.max(500, numOr('BOT_FORWARD_MAX_CHARS', DEFAULTS.FORWARD_MAX_CHARS) || DEFAULTS.FORWARD_MAX_CHARS);
+    hot.forwardMaxDepth = Math.min(4, Math.max(1, numOr('BOT_FORWARD_MAX_DEPTH', DEFAULTS.FORWARD_MAX_DEPTH) || DEFAULTS.FORWARD_MAX_DEPTH));
     return true;
   };
 
