@@ -70,6 +70,14 @@ const DEFAULTS = {
   READURL_ENABLED: false,         // 读网页正文（read_url）：默认关（会对任意 URL 发起出网请求，需显式开）
   READURL_MAX_CHARS: 4000,        // 抽出的正文最多回给模型多少字符（防烧 token）
   READURL_TIMEOUT_MS: 12000,      // 打开单个网页的超时
+  // 群聊「免@活跃窗口」意图识别（见 plugins/deepseek.js flushBucket）：只作用于被@后 2 分钟窗口内的续话消息，
+  //   判这条到底是不是在对机器人说。@/引用/关键词等明确信号不拦。默认开（空=开）。
+  //   ①命中 NOT_MINE_WORDS 明确「没跟你说话」类短语 → 结束活跃窗口 + 回 NOT_MINE_REPLY 一句后静默（需重新@唤醒）；
+  //   ②AI 语义判否 / 拿不准 / 异常 → 偏向沉默：不回，但保留窗口（只有明确短语才结束窗口）。
+  REPLY_INTENT_CHECK: true,
+  NOT_MINE_WORDS: ['没跟你说话', '不是跟你说话', '没跟你说', '不是跟你说', '没说你', '不是在说你', '不用你回', '不用回', '别接', '跟你没关系', '不是对你说的', '没对你讲'],
+  NOT_MINE_REPLY: '好的',
+  INTENT_TIMEOUT_MS: 6000,        // 意图判定这一发小请求的超时（超时即偏向沉默）
   IMAGEGEN_PROTOCOL: 'dashscope', // dashscope（百炼原生，wan/qwen 实测同步可用）| openai（标准 /images/generations）
   IMAGEGEN_ENDPOINT: '',          // 仅 dashscope 需覆盖时填完整 URL；空=由 base 推 origin 拼原生路径
 };
@@ -118,6 +126,7 @@ const HOT_KEYS = [
   'BOT_PRICE_IMAGE_PER',
   'BOT_IMAGE_SEARCH_ENABLED', 'BOT_IMAGE_SEARCH_MAX_CANDIDATES', 'BOT_IMAGE_SEARCH_VERIFY_MAX',
   'BOT_READURL_ENABLED', 'BOT_READURL_MAX_CHARS', 'BOT_READURL_TIMEOUT_MS',
+  'BOT_REPLY_INTENT_CHECK', 'BOT_NOT_MINE_WORDS', 'BOT_NOT_MINE_REPLY', 'BOT_INTENT_TIMEOUT_MS',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -168,6 +177,7 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_PRICE_IMAGE_PER: config.priceImagePer,
       BOT_IMAGE_SEARCH_ENABLED: config.imageSearchEnabled, BOT_IMAGE_SEARCH_MAX_CANDIDATES: config.imageSearchMaxCandidates, BOT_IMAGE_SEARCH_VERIFY_MAX: config.imageSearchVerifyMax,
       BOT_READURL_ENABLED: config.readUrlEnabled, BOT_READURL_MAX_CHARS: config.readUrlMaxChars, BOT_READURL_TIMEOUT_MS: config.readUrlTimeoutMs,
+      BOT_REPLY_INTENT_CHECK: config.replyIntentCheck, BOT_NOT_MINE_WORDS: config.notMineWords, BOT_NOT_MINE_REPLY: config.notMineReply, BOT_INTENT_TIMEOUT_MS: config.intentTimeoutMs,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -257,6 +267,11 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.readUrlEnabled = truthy(pick('BOT_READURL_ENABLED'));
     hot.readUrlMaxChars = Math.max(500, numOr('BOT_READURL_MAX_CHARS', DEFAULTS.READURL_MAX_CHARS) || DEFAULTS.READURL_MAX_CHARS);
     hot.readUrlTimeoutMs = Math.max(2000, numOr('BOT_READURL_TIMEOUT_MS', DEFAULTS.READURL_TIMEOUT_MS) || DEFAULTS.READURL_TIMEOUT_MS);
+    // 群聊免@窗口意图识别：默认开（空=开）。关掉则窗口内一律照常回应（回到旧行为）。
+    hot.replyIntentCheck = pick('BOT_REPLY_INTENT_CHECK') === '' ? true : truthy(pick('BOT_REPLY_INTENT_CHECK'));
+    hot.notMineWords = pick('BOT_NOT_MINE_WORDS') === '' ? DEFAULTS.NOT_MINE_WORDS.slice() : toWordList(pick('BOT_NOT_MINE_WORDS'));
+    hot.notMineReply = pick('BOT_NOT_MINE_REPLY') || DEFAULTS.NOT_MINE_REPLY;
+    hot.intentTimeoutMs = Math.max(1000, numOr('BOT_INTENT_TIMEOUT_MS', DEFAULTS.INTENT_TIMEOUT_MS) || DEFAULTS.INTENT_TIMEOUT_MS);
     return true;
   };
 

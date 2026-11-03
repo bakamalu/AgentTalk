@@ -224,6 +224,7 @@ module.exports = (ctx, config = {}) => {
   logger.info(`[生图] ${toolsLib.imagegenActive(hot) ? `开：${hot.imagegenModel} @ ${hot.imagegenBase}（限额 全局${hot.imagegenMaxPerDay || '不限'}/天、会话${hot.imagegenMaxPerChat || '不限'}/天）` : '关（未配齐 BOT_IMAGEGEN_ENABLED/BASE/MODEL/KEY）'}`);
   logger.info(`[搜图] ${toolsLib.imageSearchActive(hot) ? `开（首选拿图：搜图→逐张视觉核对至多 ${hot.imageSearchVerifyMax} 张→契合才发；生图为兜底）` : '关（BOT_IMAGE_SEARCH_ENABLED 未开）'}`);
   logger.info(`[读页] ${toolsLib.readUrlActive(hot) ? `开（read_url 打开 web_search 结果里的链接读正文，补摘要没有的深度数据；单次最多 ${hot.readUrlMaxChars} 字/${Math.round(hot.readUrlTimeoutMs / 1000)}s 超时）` : '关（BOT_READURL_ENABLED 未开）'}`);
+  logger.info(`[意图] 群免@窗口识别 ${hot.replyIntentCheck ? `开（命中“没跟你说话”类短语则结束窗口并回“${hot.notMineReply}”后静默；AI 判否或拿不准→沉默不回；本条@的是别人→也沉默不回）` : '关（窗口内一律照常回应，BOT_REPLY_INTENT_CHECK 未开）'}`);
   logger.info(`[状态] 目录 ${stateDir}（历史 ${histories.size} 个会话已恢复；${usageSummary()}）`);
 
   // ---------- 图片识别：deepseek-flash 原生多模态，但要求 OpenAI 兼容的 content 块数组 ----------
@@ -276,6 +277,28 @@ module.exports = (ctx, config = {}) => {
       }
     }
     return Boolean(session.content && String(session.content).includes(`@${selfId}`));
+  };
+
+  // @ 目标 QQ 号列表：优先结构化 elements（adapter 已把 [CQ:at,qq=x] 解成 type=at/attrs.id），拿不到再回退正则扫 content。
+  const atTargets = (session) => {
+    const ids = [];
+    if (session && Array.isArray(session.elements)) {
+      for (const el of session.elements) {
+        if (el && el.type === 'at') { const id = String(el?.attrs?.id ?? ''); if (id) ids.push(id); }
+      }
+    }
+    if (!ids.length) {
+      const c = String((session && session.content) || '');
+      const re = /\[CQ:at.*?qq=([0-9a-zA-Z]+)/gi;
+      let m; while ((m = re.exec(c)) !== null) ids.push(m[1]);
+    }
+    return ids;
+  };
+  // 本条 @ 了某个具体成员、且那个人不是机器人（排除 @全体）。normalizeText 会把 @ 抹成空格，
+  //   模型看不到 @ 的对象，故用结构化信息兜住“@ 的明显是别人却抢答”（11-03 实测误判）。
+  const isAtOther = (session) => {
+    const selfId = String(session.bot?.selfId || session.selfId || '');
+    return atTargets(session).some((id) => id !== 'all' && id !== '全部' && id !== '全体' && id !== selfId);
   };
 
   const hasTriggerKeyword = (content = '') => {
@@ -340,10 +363,12 @@ module.exports = (ctx, config = {}) => {
     for (;;) {
       // 最后一轮不再下发 tools，强制模型基于已拿到的内容给出文字答案，防止无限循环。
       const tools = round < hot.searchMaxRounds ? hub.schemas(opts.excludeTools) : [];
-      // 工具轮要给足 token：推理模型（deepseek-flash）得把“读完搜索→决定调哪个工具+参数”想完才会吐结构化调用，
-      //   正文上限 300 会把没吐完的工具调用截断成残缺 content，反而把内部标记泄漏给用户（11-03 实测）。
-      //   只有末轮（不下发 tools）才用 hot.maxTokens 收短最终自然语言回复。
-      const turnMaxTokens = tools.length ? Math.max(hot.maxTokens || 0, 2000) : hot.maxTokens;
+      // 推理模型（deepseek-flash）这一发的 max_tokens 会同时限制“思考链+正文”，给太小会把正文挤空：
+      //   ①工具轮要给足，否则“读完搜索→决定调哪个工具+参数”没想完就被截成残缺 content，反而漏 DSML 标记（11-03 实测）；
+      //   ②末轮（不下发 tools）也不能只用 hot.maxTokens（默认 300）——思考链吃满 300 就返回空 content，
+      //     抛 "empty response" 把被@的正常提问石沉大海（11-03 16:56 实测）。故末轮也给到 ≥1500 的地板。
+      //   回复实际长短仍由人格 prompt/few-shot 控住，抬高这个天花板不会让它变啰嗦。
+      const turnMaxTokens = tools.length ? Math.max(hot.maxTokens || 0, 2000) : Math.max(hot.maxTokens || 0, 1500);
       const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -384,7 +409,10 @@ module.exports = (ctx, config = {}) => {
           logger.warn(`[工具] content 含模型内部工具标记（疑似调用泄漏），丢弃本轮 round=${round}`);
           throw new Error('DeepSeek leaked tool-call markup into content');
         }
-        if (!rawText) throw new Error('DeepSeek returned an empty response');
+        if (!rawText) {
+          const fr = payload?.choices?.[0]?.finish_reason;
+          throw new Error(`DeepSeek returned an empty response (finish_reason=${fr} round=${round})`);
+        }
         return { text: rawText.trim(), usage, searched };
       }
 
@@ -440,6 +468,50 @@ module.exports = (ctx, config = {}) => {
     } catch (error) {
       logger.warn(`[搜图核对] 异常 ${String(error?.message || error).slice(0, 120)}`);
       return '';
+    }
+  };
+
+  // ---------- 群聊免@窗口消息：判这条是不是真的在对机器人说（单向二选一，关掉推理链、给极小 token 省钱省时） ----------
+  //   返回 true 仅当模型明确判“是在对机器人说”；异常/空/含糊/超时一律 false（偏向沉默，符合“拿不准不回”决策）。
+  const judgeAddressedToBot = async (messageText, contextText, chatKey) => {
+    const prompt = [
+      '你在判断群里的一条消息是不是“对机器人（也就是你）说话、需要你回应”。',
+      '背景：机器人在群里被 @ 后有分钟的免 @ 连续对话窗口；窗口内该用户又发了下面这条消息，但这次没有 @ 你。',
+      contextText ? ('[群里近期消息（仅供理解语境，不是对你说的）]\n' + contextText + '\n') : '',
+      '[待判断的消息]\n' + messageText,
+      '',
+      '问：这条消息是在对你说话、需要你回应吗？（向你提问、让你做事、回答你、接着与你的对话=是；',
+      '只是跟群里其他人聊天、自言自语、与你无关=否）只回答一个字：是 或 否。',
+    ].filter(Boolean).join('\n');
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0,
+          stream: false,
+          thinking: { type: 'disabled' },
+          max_tokens: 16,
+        }),
+        signal: AbortSignal.timeout(hot.intentTimeoutMs),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (payload?.usage && chatKey) recordUsage(chatKey, payload.usage); // 判定也花 token，计入聊天账本
+      if (!response.ok) {
+        logger.warn(`[意图] 判定请求失败 ${String(payload?.error?.message || response.status).slice(0, 120)}（偏向沉默）`);
+        return false;
+      }
+      const msg = payload?.choices?.[0]?.message || {};
+      const ans = String(msg.content || msg.reasoning_content || '').trim();
+      // 明确肯定才算“对机器人说”；含否定/不/没或空串一律沉默
+      const yes = /是|对|^y/i.test(ans) && !/否|不|没/i.test(ans);
+      logger.info(`[意图] 判定=${JSON.stringify(ans.slice(0, 20))} → ${yes ? '对机器人说' : '非/拿不准（沉默不回）'}`);
+      return yes;
+    } catch (error) {
+      logger.warn(`[意图] 判定异常 ${String(error?.message || error).slice(0, 120)}（偏向沉默）`);
+      return false;
     }
   };
 
@@ -600,6 +672,33 @@ module.exports = (ctx, config = {}) => {
       for (const line of String(it.leadingContext).split('\n')) if (line && !ctxLines.includes(line)) ctxLines.push(line);
     }
     const groupContext = ctxLines.join('\n');
+
+    // 群聊「免@活跃窗口」意图识别：整桶都是窗口内免@续话（没人@/引用/关键词）时，才判是不是真在对机器人说。
+    //   命中@/引用/关键词（definite）则跳过本闸，照常回应；私聊不进本闸。
+    //   ①命中“没跟你说话”类明确短语 → 删除 activeUntil 结束窗口 + 回一句后静默（需重新@唤醒）；
+    //   ①b 本条 @ 的是群里其他人（非机器人）：@ 被 normalizeText 抹掉、模型看不见对象，用结构化信号直接判“不是对它说”→沉默（保留窗口）；
+    //   ②AI 判“不是对它说”或拿不准 → 偏向沉默：不回，但保留窗口（只有明确短语才结束窗口）。
+    if (hot.replyIntentCheck && Boolean(session.guildId) && items.length && items.every((it) => it.definite === false)) {
+      const windowText = texts.join('\n').trim();
+      const lowText = normalizeText(windowText).toLowerCase();
+      const hitStop = lowText && hot.notMineWords.some((w) => lowText.includes(String(w).toLowerCase()));
+      if (hitStop) {
+        activeUntil.delete(chatKey);
+        logger.info(`[意图] ${session.userId} 命中“不是对机器人说”短语，结束活跃窗口并静默（需重新@）（${chatKey}）`);
+        try { await sendReply(session, hot.notMineReply, session.messageId); } catch (_) { /* 忽略 */ }
+        return;
+      }
+      // 本条 @ 的是群里其他人（非机器人）：@ 被 normalizeText 抹掉、模型看不见对象，用结构化信号直接判“不是对它说”→沉默不回、保留窗口（省一次 AI 调用）
+      if (items.some((it) => it.atOther)) {
+        logger.info(`[意图] ${session.userId} 本条 @ 的是别人而非机器人，判为不是说给机器人，沉默不回（窗口保留）（${chatKey}）`);
+        return;
+      }
+      const addressed = await judgeAddressedToBot(windowText || '[无文字]', groupContext, chatKey);
+      if (!addressed) {
+        logger.info(`[意图] 判为非对机器人说/拿不准，偏向沉默不回、窗口保留（${chatKey}）`);
+        return;
+      }
+    }
 
     // 图片下载（同一会话内串行）
     const imageDataUrls = [];
@@ -805,7 +904,11 @@ module.exports = (ctx, config = {}) => {
     if (isGroup) groupBuffer.delete(cKey);
 
     // 入合并桶：静默窗口内到达的多条消息合成一轮，统一交给模型，只回一次
-    enqueueMerge(chatKey, { session, body, imageUrls, hasAdapterQuote, quote, rawReplyId, leadingContext, forwardId, cardNote });
+    //   definite：本条含 @/引用机器人/命中触发关键词 = 明确对机器人说，供 flushBucket 意图闸跳过不拦
+    const definite = isAtBot(session) || isQuotingBot(session) || hasTriggerKeyword(rawText);
+    //   atOther：没 @ 机器人但 @ 了群里其他成员——“不是说给机器人”的强结构信号，供意图闸直接沉默
+    const atOther = !isAtBot(session) && isAtOther(session);
+    enqueueMerge(chatKey, { session, body, imageUrls, hasAdapterQuote, quote, rawReplyId, leadingContext, forwardId, cardNote, definite, atOther });
     return;
   });
 };
