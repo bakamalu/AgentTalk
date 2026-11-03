@@ -23,6 +23,7 @@ const hotconfig = require('../lib/hotconfig');
 const storeLib = require('../lib/store');
 const senderLib = require('../lib/sender');
 const quoteLib = require('../lib/quote');
+const segLib = require('../lib/segments');
 const forwardLib = require('../lib/forward');
 const toolsLib = require('../lib/tools');
 const timersLib = require('../lib/timers');
@@ -132,10 +133,13 @@ module.exports = (ctx, config = {}) => {
     logger,
     wsEndpoint: config.napcatWsEndpoint || process.env.NAPCAT_WS_ENDPOINT || 'ws://127.0.0.1:3001',
   });
+  // 非纯文本段（音乐/分享/文件/卡片/未知…）统一分派表：当前消息备注与转发节点渲染共用同一个实例（遥测也共享去重）
+  const segments = segLib.create({ logger, hot });
   // 转发（合并聊天记录）内容展开：与引用兜底同构，复用已连的网关 ws
   const forwards = forwardLib.create({
     logger,
     hot,
+    segments,
     wsEndpoint: config.napcatWsEndpoint || process.env.NAPCAT_WS_ENDPOINT || 'ws://127.0.0.1:3001',
   });
 
@@ -305,10 +309,13 @@ module.exports = (ctx, config = {}) => {
     if (hot.allowedGroups && !hot.allowedGroups.has(channelId)) return false;
 
     const at = isAtBot(session);
-    // 严格模式：群里只认 @（关键词/引用/活跃窗口都不触发）
+    // 严格模式：群里默认只认 @；但“被@后 N 秒内”允许同一个人免@续话（回答机器人的追问等）。
+    //   窗口按 chatKey(含 userId) 计，只对该用户生效，别人仍需 @——不破坏严格@的防刷屏初衷；
+    //   BOT_ACTIVE_WINDOW_MS=0 时 withinActiveWindow 恒为假，行为退回到纯严格@。
     if (hot.atOnly) {
-      if (at) logger.info(`[运营] 群 ${channelId} 唤醒（被@）`);
-      return at;
+      const awake = at || withinActiveWindow(session);
+      if (awake) logger.info(`[运营] 群 ${channelId} 唤醒（${at ? '被@' : '活跃窗口免@'}）`);
+      return awake;
     }
 
     // 群聊唤醒条件：被 @ / 命中关键词 / 引用机器人 / 处于被@后的活跃窗口（免@连续对话）
@@ -341,6 +348,7 @@ module.exports = (ctx, config = {}) => {
           messages: working,
           temperature: 0.7,
           stream: false,
+          ...(hot.maxTokens > 0 ? { max_tokens: hot.maxTokens } : {}),
           ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
         }),
         // 超时不重试：避免「其实已生成/已发送」时重复刷屏
@@ -556,14 +564,19 @@ module.exports = (ctx, config = {}) => {
     }
 
     const mergedBody = texts.join('\n');
-    const hasContent = Boolean(mergedBody || imageDataUrls.length || quoteText || forwardBlock);
+    // 非文本段备注聚合（连发多条去重）：让模型知道这条里除了字还有音乐/文件/卡片/视频…（normalizeText 已把它们从正文抹掉）
+    const cardNotes = [];
+    for (const it of items) if (it.cardNote) for (const c of String(it.cardNote).split(' ')) if (c && !cardNotes.includes(c)) cardNotes.push(c);
+    const cardNoteStr = cardNotes.join(' ');
+    const hasContent = Boolean(mergedBody || imageDataUrls.length || quoteText || forwardBlock || cardNoteStr);
 
     let finalPrompt;
     let modelInput;
     if (hasContent) {
-      const bodyText = quoteText
+      let bodyText = quoteText
         ? ('[引用' + (quoteWho ? ' ' + quoteWho : '') + '的消息] ' + quoteText + (mergedBody ? '\n[我的回应] ' + mergedBody : '')).trim()
         : (mergedBody || (imageDataUrls.length ? '（用户发来图片，未附文字）' : ''));
+      if (cardNoteStr) bodyText = (bodyText ? bodyText + '\n' : '') + '[本条消息还包含非文本内容] ' + cardNoteStr;
       // 转发全文较大：历史(finalPrompt)只留一句标记，完整内容仅在本轮喂给模型，避免逐轮重复烧 token
       const forwardLines = forwardBlock ? forwardBlock.split('\n').length : 0;
       const forwardNote = forwardLines ? ('[用户转发了一段聊天记录，共 ' + forwardLines + ' 条，内容已随本轮提供]') : '';
@@ -704,6 +717,9 @@ module.exports = (ctx, config = {}) => {
     // 群聊：记住本通道最近一次转发，以便后续被@时回捞（转发卡片自身无法 @机器人，严格@下不会直接唤醒）
     if (forwardId && isGroup) recentForward.set(cKey, { id: forwardId, ts: Date.now() });
 
+    // 非纯文本段（音乐/分享/文件/视频/卡片/未知类型…）→ 备注，随本轮喂模型（normalizeText 会把这些整段抹掉，模型否则看不见）
+    const cardNote = hot.segNotes ? segments.describeNonText(session.elements) : '';
+
     // 未唤醒：群聊暂存进 @前上下文缓冲，等待下次被 @ 时一起带出
     if (!wake) {
       if (isGroup && (rawText || imageUrls.length)) {
@@ -720,8 +736,8 @@ module.exports = (ctx, config = {}) => {
       return;
     }
 
-    // 私聊里既无正文也无图/引用/转发：忽略
-    if (!isGroup && !body && !imageUrls.length && !hasAdapterQuote && !rawReplyId && !forwardId) return;
+    // 私聊里既无正文也无图/引用/转发/卡片：忽略
+    if (!isGroup && !body && !imageUrls.length && !hasAdapterQuote && !rawReplyId && !forwardId && !cardNote) return;
 
     const chatKey = chatKeyOf(session);
     // 唤醒即刷新活跃窗口：窗口内同一人再发的消息可免@继续对话
@@ -732,7 +748,7 @@ module.exports = (ctx, config = {}) => {
     if (isGroup) groupBuffer.delete(cKey);
 
     // 入合并桶：静默窗口内到达的多条消息合成一轮，统一交给模型，只回一次
-    enqueueMerge(chatKey, { session, body, imageUrls, hasAdapterQuote, quote, rawReplyId, leadingContext, forwardId });
+    enqueueMerge(chatKey, { session, body, imageUrls, hasAdapterQuote, quote, rawReplyId, leadingContext, forwardId, cardNote });
     return;
   });
 };

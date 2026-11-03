@@ -11,6 +11,7 @@
 // ⚠ 各网关返回体形状不完全一致，首次展开会把节点 keys 记一条 info，线上跑一次即可据此校准。
 
 const { normalizeText } = require('./text');
+const segmentsLib = require('./segments');
 
 const MAX_SEGS_PER_NODE = 20; // 单条子消息最多取几个段（防止一条里塞巨多段）
 
@@ -73,7 +74,15 @@ const asNodeArray = (data) => {
   return null;
 };
 
-const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001' }) => {
+const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001', segments }) => {
+  // 转发节点的段渲染复用统一分派表（lib/segments.js）：数组段能识别音乐/文件/未知卡片等并遥测；字符串段走 normalizeText。
+  const segs = segments || segmentsLib.create({ logger, hot });
+  const renderContent = (content) => {
+    if (content == null || content === '') return '';
+    if (typeof content === 'string') return normalizeText(content);
+    if (Array.isArray(content)) return segs.renderSegs(content);
+    return normalizeText(String(content));
+  };
   // 临时直连网关（get_msg 同款套路，3s 拿不到就放弃，不拖慢回复）
   const wsGetForward = (id) => new Promise((resolve) => {
     let socket;
@@ -128,7 +137,7 @@ const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001' }) =
       if (acc.list.length >= hot.forwardMaxNodes) { acc.truncated = true; break; }
       const { uid, name } = senderOf(node);
       const rawContent = node.content ?? node.message ?? node.messages;
-      acc.list.push({ uid, name, text: segText(rawContent) });
+      acc.list.push({ uid, name, text: renderContent(rawContent) });
       const nid = nestedForwardId(rawContent);
       if (nid) await collect(session, nid, depth + 1, acc);
     }

@@ -48,6 +48,12 @@ const DEFAULTS = {
   FORWARD_MAX_NODES: 60,   // 单条转发最多展开多少条子消息
   FORWARD_MAX_CHARS: 4000, // 渲染文本块总字数上限
   FORWARD_MAX_DEPTH: 2,    // 嵌套转发递归深度上限
+  // 回复长度天花板兜底（见 plugins/deepseek.js 模型调用 max_tokens）：主要靠人格 prompt+few-shot 收短，
+  //   这里只是一个宽松硬上限，防止极端情况下刷长篇；默认 300（足够工具调用+正常长答），设 0=不下发（不限制）。
+  MAX_TOKENS: 300,
+  // 非纯文本消息段（音乐/分享/文件/视频/卡片/未知类型…）备注注入 + 未知段遥测（见 lib/segments.js）：默认开。
+  //   关掉则不再向模型描述“卡片/媒体”段、也不打遥测日志（但 @/图片/语音等既有行为不受影响）。
+  SEG_NOTES: true,
 };
 
 // 名单：空 = null（语义是“不限制”，不是“全部拒绝”）
@@ -87,6 +93,7 @@ const HOT_KEYS = [
   'BOT_REMINDER_EXEC',
   'BOT_BIGTASK_GUARD', 'BOT_BIGTASK_ACTIONS', 'BOT_BIGTASK_OBJECTS', 'BOT_BIGTASK_KEYWORDS', 'BOT_BIGTASK_REPLY',
   'BOT_FORWARD_ENABLED', 'BOT_FORWARD_MAX_NODES', 'BOT_FORWARD_MAX_CHARS', 'BOT_FORWARD_MAX_DEPTH',
+  'BOT_MAX_TOKENS', 'BOT_SEG_NOTES',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -127,6 +134,8 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_BIGTASK_OBJECTS: config.bigTaskObjects, BOT_BIGTASK_KEYWORDS: config.bigTaskKeywords, BOT_BIGTASK_REPLY: config.bigTaskReply,
       BOT_FORWARD_ENABLED: config.forwardEnabled, BOT_FORWARD_MAX_NODES: config.forwardMaxNodes,
       BOT_FORWARD_MAX_CHARS: config.forwardMaxChars, BOT_FORWARD_MAX_DEPTH: config.forwardMaxDepth,
+      BOT_MAX_TOKENS: config.maxTokens,
+      BOT_SEG_NOTES: config.segNotes,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -192,6 +201,10 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.forwardMaxNodes = Math.min(200, Math.max(1, numOr('BOT_FORWARD_MAX_NODES', DEFAULTS.FORWARD_MAX_NODES) || DEFAULTS.FORWARD_MAX_NODES));
     hot.forwardMaxChars = Math.max(500, numOr('BOT_FORWARD_MAX_CHARS', DEFAULTS.FORWARD_MAX_CHARS) || DEFAULTS.FORWARD_MAX_CHARS);
     hot.forwardMaxDepth = Math.min(4, Math.max(1, numOr('BOT_FORWARD_MAX_DEPTH', DEFAULTS.FORWARD_MAX_DEPTH) || DEFAULTS.FORWARD_MAX_DEPTH));
+    // 回复长度天花板：0=不限制（不下发 max_tokens）；否则作为硬上限。故意给宽松值，主要靠 prompt+few-shot 收短。
+    hot.maxTokens = numOr('BOT_MAX_TOKENS', DEFAULTS.MAX_TOKENS);
+    // 非文本段备注+遥测开关：默认开（空=开）。
+    hot.segNotes = pick('BOT_SEG_NOTES') === '' ? true : truthy(pick('BOT_SEG_NOTES'));
     return true;
   };
 
