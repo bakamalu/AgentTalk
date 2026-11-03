@@ -12,9 +12,12 @@ const websearch = require('./websearch');
 const timersLib = require('./timers');
 const membersLib = require('./members');
 const imagegenLib = require('./imagegen');
+const imagesearchLib = require('./imagesearch');
 
 // 生图是否真正可用：必须开启且配齐 base/model/key（缺任一都不下发工具，能力边界也要同步说“不能画”）。
 const imagegenActive = (hot) => Boolean(hot.imagegenEnabled && hot.imagegenBase && hot.imagegenKey && hot.imagegenModel);
+// 搜图（首选拿图）是否可用：只需开关（发送/视觉核对通道在 exec 里按 execCtx 实参再校验）。
+const imageSearchActive = (hot) => Boolean(hot.imageSearchEnabled);
 
 // opts: { logger, hot, timers }（timers 为 lib/timers.js create 出的实例；未传则不下发提醒工具）
 const create = ({ logger, hot, timers }) => {
@@ -46,6 +49,8 @@ const create = ({ logger, hot, timers }) => {
     if (hot.reminderEnabled && timers) list.push(...timersLib.REMINDER_TOOLS);
     // 生图独立于联网搜索：配齐即下发（见 imagegenActive）
     if (imagegenActive(hot)) list.push(imagegenLib.TOOL);
+    // 搜图（首选）：开了就下发；执行时若无发送/视觉核对通道会回退为文字提示
+    if (imageSearchActive(hot)) list.push(imagesearchLib.TOOL);
     if (!excludeNames || !excludeNames.length) return list;
     const ex = new Set(excludeNames);
     return list.filter((t) => !ex.has(t.function.name));
@@ -159,6 +164,50 @@ const create = ({ logger, hot, timers }) => {
       return { text: '图片已经生成并发送给用户了。现在只需补一句 ≤20 字的自然配文（可以直接为空）。⚠ 绝不要说“我按了发送键/我点了发送/图发过去了”这类操作 QQ 界面的话，也不要再复述图片内容。', queries: ['生图:已发'], hits: 1 };
     }
 
+    // ---------- 搜图（首选拿图）：搜→逐张视觉核对是否契合→契合才发；都不契合交回模型走生图兜底 ----------
+    if (name === 'search_image') {
+      if (!imageSearchActive(hot)) {
+        return { text: '搜图能力当前未开启。若需要图请据实说明，或在生图能力开启时用 generate_image；不要谎称已发过图。', queries: ['搜图:off'], hits: 0 };
+      }
+      if (typeof execCtx.sendImage !== 'function' || typeof execCtx.visionCheck !== 'function') {
+        return { text: '当前会话拿不到发送/视觉核对通道，搜到的图发不出去。请如实告知用户这次没找到图，不要谎称已发送。', queries: ['搜图:nochan'], hits: 0 };
+      }
+      const q = String(args.query || '').trim();
+      if (!q) return { text: '缺少搜图关键词。请补一个 2~4 词的关键词再试。', queries: ['搜图:空词'], hits: 0 };
+      const found = await imagesearchLib.searchImages(q, {
+        logger, maxCandidates: hot.imageSearchMaxCandidates, timeoutMs: hot.searchTimeoutMs,
+      });
+      if (!found.urls.length) {
+        return { text: imagegenActive(hot)
+          ? `网上没搜到「${found.query || q}」相关的图。现在可以调用 generate_image 兜底画一张，或如实告诉用户没找到合适的图。`
+          : `网上没搜到「${found.query || q}」相关的图。请如实告诉用户没找到合适的图，不要假装发过图。`,
+          queries: ['搜图:空'], hits: 0 };
+      }
+      const verifyPrompt = imagesearchLib.buildVerifyPrompt(args.need, found.query || q);
+      const verifyCap = Math.max(1, hot.imageSearchVerifyMax);
+      let checked = 0; // 真正做了视觉核对的张数（下载失败不计，避免死链吃光额度）
+      for (const u of found.urls) {
+        if (checked >= verifyCap) break;
+        const img = await imagesearchLib.fetchImageBase64(u, { logger, timeoutMs: hot.imageTimeoutMs });
+        if (!img) { logger.info(`[搜图] 下载失败/不可用，跳过 ${String(u).slice(0, 80)}`); continue; }
+        checked += 1;
+        const verdict = await execCtx.visionCheck(img.dataUrl, verifyPrompt);
+        const v = imagesearchLib.parseVerdict(verdict);
+        logger.info(`[搜图] 第${checked}张核对 ${v.fits ? '契合' : '不契合'}（${String(verdict || '').slice(0, 40)}） ${String(u).slice(0, 80)}`);
+        if (!v.fits) continue;
+        const sent = await execCtx.sendImage(img.base64File, '');
+        if (!sent) {
+          return { text: '找到契合的图但发送失败（通道被拒）。请告知用户没收到、请稍后再试，不要谎称已发送。', queries: ['搜图:发送失败'], hits: 0 };
+        }
+        return { text: '已从网上找到契合当前场景的图片并发送给用户了。现在只需补一句 ≤20 字的自然配文（可为空）。⚠ 绝不要说“我按了发送键/我点了发送/图发过去了”这类操作 QQ 界面的话，也不要复述图片细节。', queries: [`搜图:已发#${checked}`], hits: 1 };
+      }
+      const why = checked ? `核对 ${checked} 张都不够契合当前场景` : (found.urls.length ? `${found.urls.length} 张候选都下载失败` : '没搜到候选');
+      return { text: imagegenActive(hot)
+        ? `网上搜图${why}。现在可以调用 generate_image 兜底画一张，或如实告诉用户没找到合适的图。`
+        : `网上搜图${why}。请如实告诉用户没找到合适的图，不要假装发过图。`,
+        queries: [`搜图:不合(${checked}核对)`], hits: 0 };
+    }
+
     return { text: `未知工具「${name}」，请直接文字回答，不要编造工具结果。`, queries: [name], hits: 0 };
   },
   });
@@ -193,17 +242,25 @@ const describeCapabilities = (hot) => {
   } else {
     parts.push('你没有定时提醒能力，用户要你过一会儿叫他时必须如实说叫不了（建议他自己设闹钟），绝对不要假装会到点叫他。');
   }
-  // 生图能力边界必须与 schemas 实际下发一致（imagegenActive）：能画就教会它必须真调用工具，
-  //   不能画就禁止它谎称“点了发送键/先手绘一个”（那类幻觉正是 11-03 的真实故障）。
-  if (imagegenActive(hot)) {
-    parts.push('你能生成图片：用户想要图（画个XX/来张图/生成一张…插画/头像/表情包配图等）时，必须调用 generate_image 真的把图画出来发送，绝不能只口头说“画好了”而不调用工具。'
-      + '调用时把画面描述写具体（主体+风格+氛围）；一次画一张，生成后系统会自动把图发给用户，你只补一句简短配文即可，'
-      + '不要说“我按了发送键/我点了发送”之类操作 QQ 界面的话。工具若返回失败或已达上限，就如实说这次画不了，不要假装发过图。');
+  // 图片能力边界必须与 schemas 实际下发一致：搜图（首选）+ 生图（兜底）按开关组合，
+  //   且都禁止“口头答应/谎称按了发送键/手绘”这类幻觉（11-03 真实故障）。
+  const searchOn = imageSearchActive(hot);
+  const genOn = imagegenActive(hot);
+  if (searchOn && genOn) {
+    parts.push('用户想要图时，**优先调用 search_image**：它按关键词搜真实图片并逐张核对是否契合当前场景，契合就直接发给用户。'
+      + '只有 search_image 明确返回“没搜到/都不契合”、或用户明确要“原创/画一张现实中没有的东西”时，才改用 generate_image 兜底；不要因为用户随口要图就直接凭空生图。'
+      + '两个工具若返回失败/发送失败，就如实说这次没找到或画不了，绝不谎称“已发/按了发送键/先手绘”。');
+  } else if (searchOn) {
+    parts.push('用户想要图时调用 search_image（按关键词搜图并核对契合后发送）。搜不到/都不契合就如实说没找到合适的图；'
+      + '你没有生图能力，绝不谎称“已发/按了发送键/先手绘一个”。');
+  } else if (genOn) {
+    parts.push('你能生成图片：用户想要图时必须调用 generate_image 真的画出并发送，绝不能只口头说“画好了”。把画面描述写具体（主体+风格+氛围），一次一张，'
+      + '生成后系统自动发给用户，你只补一句简短配文；不要说“我按了发送键/点了发送”之类操作 QQ 界面的话。工具返回失败或达上限就如实说画不了，不要假装发过图。');
   } else {
-    parts.push('你没有生成图片的能力。用户要你画图/发图/给表情包图时，必须如实说只能用文字、画不了图；'
-      + '绝对不要谎称“按不了发送键所以先给你手绘的”“图已发过去”之类——你既不能操作 QQ 界面，也没有生图能力。');
+    parts.push('你没有搜图也没有生图能力。用户要你画图/发图/给表情包图时，必须如实说只能用文字、给不了图；'
+      + '绝对不要谎称“按不了发送键所以先给你手绘的”“图已发过去”之类——你既不能操作 QQ 界面，也没有任何出图能力。');
   }
   return parts.join('\n');
 };
 
-module.exports = { create, describeCapabilities, imagegenActive, weather, websearch, timers: timersLib, imagegen: imagegenLib };
+module.exports = { create, describeCapabilities, imagegenActive, imageSearchActive, weather, websearch, timers: timersLib, imagegen: imagegenLib, imagesearch: imagesearchLib };

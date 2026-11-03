@@ -64,6 +64,9 @@ const DEFAULTS = {
   IMAGEGEN_MAX_PER_DAY: 30,   // 全局每日上限（0=不限）
   IMAGEGEN_MAX_PER_CHAT: 5,   // 单会话每日上限（0=不限）
   PRICE_IMAGE_PER: 0,         // 生图单价（元/张）：与 token 记账同级的独立账本；0=只记张数不计费
+  IMAGE_SEARCH_ENABLED: false, // 关键词搜图（首选拿图方式，生图为兜底）；开了才下发 search_image
+  IMAGE_SEARCH_MAX_CANDIDATES: 5, // 一次搜几张候选图
+  IMAGE_SEARCH_VERIFY_MAX: 3,     // 最多逐张视觉核对几张（都不契合→生图兜底）
   IMAGEGEN_PROTOCOL: 'dashscope', // dashscope（百炼原生，wan/qwen 实测同步可用）| openai（标准 /images/generations）
   IMAGEGEN_ENDPOINT: '',          // 仅 dashscope 需覆盖时填完整 URL；空=由 base 推 origin 拼原生路径
 };
@@ -110,6 +113,7 @@ const HOT_KEYS = [
   'BOT_IMAGEGEN_SIZE', 'BOT_IMAGEGEN_TIMEOUT_MS', 'BOT_IMAGEGEN_MAX_PER_DAY', 'BOT_IMAGEGEN_MAX_PER_CHAT',
   'BOT_IMAGEGEN_PROTOCOL', 'BOT_IMAGEGEN_ENDPOINT',
   'BOT_PRICE_IMAGE_PER',
+  'BOT_IMAGE_SEARCH_ENABLED', 'BOT_IMAGE_SEARCH_MAX_CANDIDATES', 'BOT_IMAGE_SEARCH_VERIFY_MAX',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -158,6 +162,7 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_IMAGEGEN_MAX_PER_DAY: config.imagegenMaxPerDay, BOT_IMAGEGEN_MAX_PER_CHAT: config.imagegenMaxPerChat,
       BOT_IMAGEGEN_PROTOCOL: config.imagegenProtocol, BOT_IMAGEGEN_ENDPOINT: config.imagegenEndpoint,
       BOT_PRICE_IMAGE_PER: config.priceImagePer,
+      BOT_IMAGE_SEARCH_ENABLED: config.imageSearchEnabled, BOT_IMAGE_SEARCH_MAX_CANDIDATES: config.imageSearchMaxCandidates, BOT_IMAGE_SEARCH_VERIFY_MAX: config.imageSearchVerifyMax,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -240,6 +245,9 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.imagegenProtocol = (pick('BOT_IMAGEGEN_PROTOCOL').trim() || DEFAULTS.IMAGEGEN_PROTOCOL).toLowerCase();
     hot.imagegenEndpoint = pick('BOT_IMAGEGEN_ENDPOINT').trim();
     hot.priceImagePer = Math.max(0, numOr('BOT_PRICE_IMAGE_PER', DEFAULTS.PRICE_IMAGE_PER));
+    hot.imageSearchEnabled = truthy(pick('BOT_IMAGE_SEARCH_ENABLED'));
+    hot.imageSearchMaxCandidates = Math.max(1, numOr('BOT_IMAGE_SEARCH_MAX_CANDIDATES', DEFAULTS.IMAGE_SEARCH_MAX_CANDIDATES));
+    hot.imageSearchVerifyMax = Math.max(1, numOr('BOT_IMAGE_SEARCH_VERIFY_MAX', DEFAULTS.IMAGE_SEARCH_VERIFY_MAX));
     return true;
   };
 

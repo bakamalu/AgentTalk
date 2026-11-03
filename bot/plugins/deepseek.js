@@ -180,7 +180,7 @@ module.exports = (ctx, config = {}) => {
   // 大型任务校验：不看字数，看「构建意图」。命中就玩笑回绝，不进模型、不烧 token。
   // 维度一（主力）：同时出现【动作】+【构建对象】——如“编写…程序”“做个…游戏”“开发…网站”，
   //   两个都得中才算，避免“我在玩游戏”“帮我写个请假条”这类单边命中误伤。
-  // 维度二（兑底）：整段大工程短语（“整个项目”“从零开始”等），命中一个即可。
+  // 维度二（兜底）：整段大工程短语（“整个项目”“从零开始”等），命中一个即可。
   // 纯启发式、非语义理解；误伤时用户换个说法或管理员关掉 BOT_BIGTASK_GUARD 即可。返回命中原因（写日志），空串放行。
   const bigTaskReason = (text) => {
     const t = String(text || '');
@@ -222,6 +222,7 @@ module.exports = (ctx, config = {}) => {
   logger.info(`[上下文] @前群聊上下文 ${hot.groupContextMax > 0 ? `最近 ${hot.groupContextMax} 条/${Math.round(hot.groupContextMs / 1000)}s` : '关'}；@后免@活跃窗口 ${hot.activeWindowMs > 0 ? Math.round(hot.activeWindowMs / 1000) + 's' : '关'}`);
   logger.info(`[模式] ${hot.atOnly ? '严格@（群里只有被@才回应）' : '常规（@/关键词/引用/活跃窗口）'}；连发合并 ${hot.mergeWindowMs > 0 ? Math.round(hot.mergeWindowMs / 1000) + 's' : '关'}；mentionOnly=${mentionOnly}`);
   logger.info(`[生图] ${toolsLib.imagegenActive(hot) ? `开：${hot.imagegenModel} @ ${hot.imagegenBase}（限额 全局${hot.imagegenMaxPerDay || '不限'}/天、会话${hot.imagegenMaxPerChat || '不限'}/天）` : '关（未配齐 BOT_IMAGEGEN_ENABLED/BASE/MODEL/KEY）'}`);
+  logger.info(`[搜图] ${toolsLib.imageSearchActive(hot) ? `开（首选拿图：搜图→逐张视觉核对至多 ${hot.imageSearchVerifyMax} 张→契合才发；生图为兜底）` : '关（BOT_IMAGE_SEARCH_ENABLED 未开）'}`);
   logger.info(`[状态] 目录 ${stateDir}（历史 ${histories.size} 个会话已恢复；${usageSummary()}）`);
 
   // ---------- 图片识别：deepseek-flash 原生多模态，但要求 OpenAI 兼容的 content 块数组 ----------
@@ -393,6 +394,41 @@ module.exports = (ctx, config = {}) => {
         for (const q of result.queries || []) searched.push(q);
         working.push({ role: 'tool', tool_call_id: call.id, name, content: result.text });
       }
+    }
+  };
+
+  // ---------- 搜图的视觉核对：单发一次多模态请求判“是否契合”（不进工具循环），顺带记 token 用量 ----------
+  const visionCheck = async (dataUrl, question, chatKey) => {
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: [
+            { type: 'text', text: question },
+            { type: 'image_url', image_url: { url: dataUrl } },
+          ] }],
+          temperature: 0.2,
+          stream: false,
+          // 视觉核对是二选一判断，关掉 deepseek-flash 的推理链（否则思考会吃满 max_tokens 导致正文为空）
+          thinking: { type: 'disabled' },
+          max_tokens: 64,
+        }),
+        signal: AbortSignal.timeout(requestTimeoutMs),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (payload?.usage && chatKey) recordUsage(chatKey, payload.usage); // 校验也花 token，计入聊天账本
+      if (!response.ok) {
+        logger.warn(`[搜图核对] 模型报错 ${String(payload?.error?.message || response.status).slice(0, 120)}`);
+        return '';
+      }
+      const msg = payload?.choices?.[0]?.message || {};
+      // 正文为空时兜底读 reasoning_content（万一切换的模型仍强制思考、正文被截断）
+      return String(msg.content || msg.reasoning_content || '').trim();
+    } catch (error) {
+      logger.warn(`[搜图核对] 异常 ${String(error?.message || error).slice(0, 120)}`);
+      return '';
     }
   };
 
@@ -624,6 +660,8 @@ module.exports = (ctx, config = {}) => {
         sendImage: (file, caption) => sendImage(session, file, caption),
         // 生图计费：发图成功后按张记入与 token 同级的“生图账本”（单价 hot.priceImagePer 元/张）
         billImage: (count) => recordImage(chatKey, { count, unitPrice: hot.priceImagePer }),
+        // 搜图视觉核对：把候选图喂模型判“是否契合”（一次性多模态调用，token 计入聊天账本）
+        visionCheck: (dataUrl, question) => visionCheck(dataUrl, question, chatKey),
       });
       const badWord = hitSensitive(result.text);
       if (badWord) {

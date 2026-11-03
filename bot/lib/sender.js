@@ -158,7 +158,7 @@ const create = ({ logger, hot, limits = {} }) => {
   // ---------- 发送一张图片（生图等产物）----------
   // 路由与 send 同口径：群必须走 sendGroupMsg（段数组 [image,(text)]），私聊走 sendPrivateMsg。
   // file 是 OneBot 图片段 data.file 的值：远程 URL，或 base64://<数据>。
-  // 失败只记日志、返回布尔（不抛），交调用方（tools.generate_image）兑底告知用户。
+  // 失败只记日志、返回布尔（不抛），交调用方（tools.generate_image）兜底告知用户。
   const sendImage = async (session, file, caption = '') => {
     const bot = session.bot;
     const f = String(file || '').trim();
