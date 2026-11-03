@@ -48,6 +48,87 @@ module.exports = (ctx, config = {}) => {
   const botEnvFile = config.botEnvFile || process.env.BOT_ENV_FILE || '/root/deploy/bot.env';
   const hotIntervalMs = Math.max(2000, Number(config.hotIntervalMs ?? process.env.BOT_HOT_INTERVAL_MS ?? 5000));
 
+  // ---------- 接口队列：主接口繁忙/不支持就按顺序切下一个（粘住可用项 + 定期回探主接口） ----------
+  //   一条接口 = base+key+model 三件套；主接口取自 DEEPSEEK_BASE_URL/KEY/MODEL，备用接口写在 BOT_API_QUEUE（JSON 数组，可扩展）。
+  //   属结构级配置，改队列需重启插件（非热生效）。visionCheck（多模态）不走本队列，固定用主接口，见其函数。
+  const parseEndpoints = () => {
+    const list = [{ base: baseUrl, key: apiKey, model }];
+    const raw = String(config.apiQueue || process.env.BOT_API_QUEUE || '').trim();
+    if (raw) {
+      try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) {
+          for (const it of arr) {
+            if (!it) continue;
+            const base = String(it.base || it.baseUrl || it.url || '').replace(/\/$/, '');
+            if (!base) continue;
+            list.push({ base, key: String(it.key || it.apiKey || apiKey || ''), model: String(it.model || model) });
+          }
+        }
+      } catch (error) {
+        logger.warn('[接口队列] BOT_API_QUEUE 解析失败，本次仅用主接口：' + String(error?.message || error).slice(0, 120));
+      }
+    }
+    const seen = new Set(); const uniq = [];
+    for (const ep of list) { const k = `${ep.base}|${ep.model}`; if (seen.has(k)) continue; seen.add(k); uniq.push(ep); }
+    return uniq;
+  };
+  const endpoints = parseEndpoints();
+  let preferredIndex = 0;   // 粘住最近一次成功的接口；初始 0 = 主接口
+
+  // 统一走队列的 chat/completions：makeBody(ep) 产出请求体（model 随接口而定），命中失败/异常就顺序切下一个。
+  const chatComplete = async (makeBody, opts = {}) => {
+    const n = endpoints.length;
+    const timeoutMs = opts.timeoutMs || requestTimeoutMs;
+    let lastErr = null;
+    for (let step = 0; step < n; step++) {
+      const idx = (preferredIndex + step) % n;
+      const ep = endpoints[idx];
+      try {
+        const response = await fetch(`${ep.base}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ep.key}` },
+          body: JSON.stringify(makeBody(ep)),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (response.ok) {
+          if (idx !== preferredIndex) logger.info(`[接口队列] 切到可用接口 #${idx + 1}/${n} ${ep.model} @ ${ep.base}`);
+          preferredIndex = idx;
+          return { payload, endpoint: ep };
+        }
+        const detail = String(payload?.error?.message || payload?.message || `HTTP ${response.status}`);
+        lastErr = new Error(`HTTP ${response.status}: ${detail}`);
+        logger.warn(`[接口队列] #${idx + 1}/${n} ${ep.model} @ ${ep.base} 不可用（${detail.slice(0, 140)}）${step + 1 < n ? '→ 切下一个接口' : '→ 队列已尽'}`);
+      } catch (error) {
+        lastErr = error;
+        logger.warn(`[接口队列] #${idx + 1}/${n} ${ep.model} @ ${ep.base} 请求异常（${String(error?.message || error).slice(0, 140)}）${step + 1 < n ? '→ 切下一个接口' : '→ 队列已尽'}`);
+      }
+    }
+    throw lastErr || new Error('DeepSeek: all API endpoints unavailable');
+  };
+
+  // 定期回探主接口：一旦粘到备用上，就隔一段时间用一次极便宜的 ping 探主；主接口恢复就自动切回（避免一直赖在备用上）。
+  const apiProbeMs = Math.max(30000, Number(config.apiProbeMs ?? process.env.BOT_API_PROBE_MS ?? 300000));
+  if (endpoints.length > 1) {
+    const probePrimary = async () => {
+      if (preferredIndex === 0) return;
+      const ep = endpoints[0];
+      try {
+        const response = await fetch(`${ep.base}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ep.key}` },
+          body: JSON.stringify({ model: ep.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0 }),
+          signal: AbortSignal.timeout(Math.min(15000, requestTimeoutMs)),
+        });
+        if (response.ok) { preferredIndex = 0; logger.info(`[接口队列] 回探主接口已恢复 #1 ${ep.model} @ ${ep.base} → 切回主接口`); }
+        else logger.info(`[接口队列] 回探主接口仍不可用（HTTP ${response.status}），继续用 #${preferredIndex + 1}`);
+      } catch (error) { /* 主接口还挂着，静待下次回探 */ }
+    };
+    const apiProbeTimer = setInterval(() => { probePrimary().catch(() => {}); }, apiProbeMs);
+    if (typeof apiProbeTimer.unref === 'function') apiProbeTimer.unref();
+  }
+
   // ---------- 各层装配 ----------
   const { hot, maybeReload } = hotconfig.create({ config, logger, botEnvFile });
   const store = storeLib.create({
@@ -225,6 +306,7 @@ module.exports = (ctx, config = {}) => {
   logger.info(`[搜图] ${toolsLib.imageSearchActive(hot) ? `开（首选拿图：搜图→逐张视觉核对至多 ${hot.imageSearchVerifyMax} 张→契合才发；生图为兜底）` : '关（BOT_IMAGE_SEARCH_ENABLED 未开）'}`);
   logger.info(`[读页] ${toolsLib.readUrlActive(hot) ? `开（read_url 打开 web_search 结果里的链接读正文，补摘要没有的深度数据；单次最多 ${hot.readUrlMaxChars} 字/${Math.round(hot.readUrlTimeoutMs / 1000)}s 超时）` : '关（BOT_READURL_ENABLED 未开）'}`);
   logger.info(`[意图] 群免@窗口识别 ${hot.replyIntentCheck ? `开（命中“没跟你说话”类短语则结束窗口并回“${hot.notMineReply}”后静默；AI 判否或拿不准→沉默不回；本条@的是别人→也沉默不回）` : '关（窗口内一律照常回应，BOT_REPLY_INTENT_CHECK 未开）'}`);
+  logger.info(`[接口] 队列 ${endpoints.length} 条：${endpoints.map((ep, i) => `${i + 1}.${ep.model}@${ep.base}`).join(' → ')}${endpoints.length > 1 ? `（命中繁忙/不支持自动按序切下一个，粘住可用项，每 ${Math.round(apiProbeMs / 1000)}s 回探主接口）` : '（仅主接口，配 BOT_API_QUEUE 可加备用）'}`);
   logger.info(`[状态] 目录 ${stateDir}（历史 ${histories.size} 个会话已恢复；${usageSummary()}）`);
 
   // ---------- 图片识别：deepseek-flash 原生多模态，但要求 OpenAI 兼容的 content 块数组 ----------
@@ -369,29 +451,15 @@ module.exports = (ctx, config = {}) => {
       //     抛 "empty response" 把被@的正常提问石沉大海（11-03 16:56 实测）。故末轮也给到 ≥1500 的地板。
       //   回复实际长短仍由人格 prompt/few-shot 控住，抬高这个天花板不会让它变啰嗦。
       const turnMaxTokens = tools.length ? Math.max(hot.maxTokens || 0, 2000) : Math.max(hot.maxTokens || 0, 1500);
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages: working,
-          temperature: 0.7,
-          stream: false,
-          ...(turnMaxTokens > 0 ? { max_tokens: turnMaxTokens } : {}),
-          ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
-        }),
-        // 超时不重试：避免「其实已生成/已发送」时重复刷屏
-        signal: AbortSignal.timeout(requestTimeoutMs),
-      });
-
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const detail = payload?.error?.message || payload?.message || 'DeepSeek request failed';
-        throw new Error(detail);
-      }
+      // 走接口队列：主接口繁忙/不支持就按顺序切下一个（详见 chatComplete）；model 随所用接口而定。
+      const { payload } = await chatComplete((ep) => ({
+        model: ep.model,
+        messages: working,
+        temperature: 0.7,
+        stream: false,
+        ...(turnMaxTokens > 0 ? { max_tokens: turnMaxTokens } : {}),
+        ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
+      }));
       // 多轮（含工具往返）的 token 要累加，否则用量统计和成本会偏低。
       if (payload?.usage) {
         usage.prompt_tokens += payload.usage.prompt_tokens || 0;
@@ -484,25 +552,16 @@ module.exports = (ctx, config = {}) => {
       '只是跟群里其他人聊天、自言自语、与你无关=否）只回答一个字：是 或 否。',
     ].filter(Boolean).join('\n');
     try {
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'user', content: prompt }],
-          temperature: 0,
-          stream: false,
-          thinking: { type: 'disabled' },
-          max_tokens: 16,
-        }),
-        signal: AbortSignal.timeout(hot.intentTimeoutMs),
-      });
-      const payload = await response.json().catch(() => ({}));
+      // 走接口队列（主接口繁忙/不支持自动切下一个）；model 随接口；非 deepseek 接口不下发 thinking 字段以免被判不支持。
+      const { payload } = await chatComplete((ep) => ({
+        model: ep.model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0,
+        stream: false,
+        ...(/deepseek/i.test(ep.base) ? { thinking: { type: 'disabled' } } : {}),
+        max_tokens: 16,
+      }), { timeoutMs: hot.intentTimeoutMs });
       if (payload?.usage && chatKey) recordUsage(chatKey, payload.usage); // 判定也花 token，计入聊天账本
-      if (!response.ok) {
-        logger.warn(`[意图] 判定请求失败 ${String(payload?.error?.message || response.status).slice(0, 120)}（偏向沉默）`);
-        return false;
-      }
       const msg = payload?.choices?.[0]?.message || {};
       const ans = String(msg.content || msg.reasoning_content || '').trim();
       // 明确肯定才算“对机器人说”；含否定/不/没或空串一律沉默
@@ -544,7 +603,7 @@ module.exports = (ctx, config = {}) => {
       const turns = [...histories.values()].reduce((n, list) => n + Math.floor(list.length / 2), 0);
       const lines = [
         '【机器人状态】',
-        `模型：${model} @ ${baseUrl}`,
+        `模型：${model} @ ${baseUrl}；接口队列 ${endpoints.length} 条（当前走 #${preferredIndex + 1} ${endpoints[preferredIndex].model}@${endpoints[preferredIndex].base}）`,
         `上下文：活跃会话 ${histories.size} 个，累计 ${turns} 轮（已持久化）`,
         `白名单：私聊 ${describe(hot.allowedUsers, '不限制')}；群聊 ${describe(hot.allowedGroups, '不限制')}`,
         `黑名单：用户 ${countText(hot.blacklistedUsers)}，群 ${countText(hot.blacklistedGroups)}；敏感词 ${hot.sensitiveWords.length ? hot.sensitiveWords.length + ' 个' : '未启用'}，拦截通知 ${hot.sensitiveNotify ? '开' : '仅日志'}`,
@@ -788,6 +847,8 @@ module.exports = (ctx, config = {}) => {
       logger.info(`DeepSeek 回复 [${chatKey}] 合并 ${items.length} 条 历史轮次=${Math.floor(getHistory(chatKey).length / 2)}`
         + ` 工具=${searchedBrief(result.searched)}`);
       logger.info(`[回复] ${chatKey}: ${result.text.replace(/\s+/g, ' ').slice(0, 120)}`);
+      // 真要给这个用户回复了 → 此刻才续活跃窗口（handler 只给 definite 预续；能走到这里说明模糊消息已过意图闸、判为“对机器人说”）
+      if (Boolean(session.guildId) && hot.activeWindowMs > 0) activeUntil.set(chatKey, Date.now() + hot.activeWindowMs);
       await sendReply(session, result.text, session.messageId);
     } catch (error) {
       logger.error('DeepSeek reply failed:', error);
@@ -896,18 +957,18 @@ module.exports = (ctx, config = {}) => {
     if (!isGroup && !body && !imageUrls.length && !hasAdapterQuote && !rawReplyId && !forwardId && !cardNote) return;
 
     const chatKey = chatKeyOf(session);
-    // 唤醒即刷新活跃窗口：窗口内同一人再发的消息可免@继续对话
-    if (isGroup && hot.activeWindowMs > 0) activeUntil.set(chatKey, Date.now() + hot.activeWindowMs);
+    //   definite：本条含 @/引用机器人/命中触发关键词 = 明确对机器人说；atOther：没@机器人却@了别人 = 强“不是说给我”信号
+    const definite = isAtBot(session) || isQuotingBot(session) || hasTriggerKeyword(rawText);
+    const atOther = !isAtBot(session) && isAtOther(session);
+    // 活跃窗口续期只在“明确对机器人说(definite)”时立即做；窗口免@的模糊消息先不续，
+    //   交 flushBucket 意图闸：判“是对我说话”并真回复时再续，判“不是对我说/沉默”则不续（让窗口自然到期）。
+    if (isGroup && hot.activeWindowMs > 0 && definite) activeUntil.set(chatKey, Date.now() + hot.activeWindowMs);
 
     // 取 @前群上下文快照并清空缓冲：与随后连发的消息合并进同一轮
     const leadingContext = isGroup ? takeGroupContext(cKey) : '';
     if (isGroup) groupBuffer.delete(cKey);
 
-    // 入合并桶：静默窗口内到达的多条消息合成一轮，统一交给模型，只回一次
-    //   definite：本条含 @/引用机器人/命中触发关键词 = 明确对机器人说，供 flushBucket 意图闸跳过不拦
-    const definite = isAtBot(session) || isQuotingBot(session) || hasTriggerKeyword(rawText);
-    //   atOther：没 @ 机器人但 @ 了群里其他成员——“不是说给机器人”的强结构信号，供意图闸直接沉默
-    const atOther = !isAtBot(session) && isAtOther(session);
+    // 入合并桶：静默窗口内到达的多条消息合成一轮，统一交给模型，只回一次（definite/atOther 供 flushBucket 意图闸）
     enqueueMerge(chatKey, { session, body, imageUrls, hasAdapterQuote, quote, rawReplyId, leadingContext, forwardId, cardNote, definite, atOther });
     return;
   });
