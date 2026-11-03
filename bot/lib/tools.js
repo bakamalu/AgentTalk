@@ -13,11 +13,14 @@ const timersLib = require('./timers');
 const membersLib = require('./members');
 const imagegenLib = require('./imagegen');
 const imagesearchLib = require('./imagesearch');
+const readpageLib = require('./readpage');
 
 // 生图是否真正可用：必须开启且配齐 base/model/key（缺任一都不下发工具，能力边界也要同步说“不能画”）。
 const imagegenActive = (hot) => Boolean(hot.imagegenEnabled && hot.imagegenBase && hot.imagegenKey && hot.imagegenModel);
 // 搜图（首选拿图）是否可用：只需开关（发送/视觉核对通道在 exec 里按 execCtx 实参再校验）。
 const imageSearchActive = (hot) => Boolean(hot.imageSearchEnabled);
+// 读网页正文（read_url）是否可用：只需开关（配合 web_search 给出的链接补深度数据，非独立拿图通道）。
+const readUrlActive = (hot) => Boolean(hot.readUrlEnabled);
 
 // opts: { logger, hot, timers }（timers 为 lib/timers.js create 出的实例；未传则不下发提醒工具）
 const create = ({ logger, hot, timers }) => {
@@ -51,6 +54,8 @@ const create = ({ logger, hot, timers }) => {
     if (imagegenActive(hot)) list.push(imagegenLib.TOOL);
     // 搜图（首选）：开了就下发；执行时若无发送/视觉核对通道会回退为文字提示
     if (imageSearchActive(hot)) list.push(imagesearchLib.TOOL);
+    // 读网页正文：开了才下发（配合 web_search 结果里的链接补深度数据）
+    if (readUrlActive(hot)) list.push(readpageLib.TOOL);
     if (!excludeNames || !excludeNames.length) return list;
     const ex = new Set(excludeNames);
     return list.filter((t) => !ex.has(t.function.name));
@@ -88,6 +93,15 @@ const create = ({ logger, hot, timers }) => {
         timeoutMs: hot.searchTimeoutMs,
       });
       return { text: result.text, queries: result.queries, hits: result.hits };
+    }
+
+    // ---------- 读网页正文（read_url）：打开 web_search 结果里的链接补深度数据 ----------
+    if (name === 'read_url') {
+      if (!readUrlActive(hot)) {
+        return { text: '读网页正文能力当前已关闭。请据 web_search 摘要如实回答，查不到就说明，不要编造。', queries: ['读页:off'], hits: 0 };
+      }
+      const r = await readpageLib.read(args.url, { logger, timeoutMs: hot.readUrlTimeoutMs, maxChars: hot.readUrlMaxChars });
+      return { text: r.text, queries: [`读页:${r.ok ? 'ok' : 'fail'}:${String(r.url || '').slice(0, 40)}`], hits: r.ok ? 1 : 0 };
     }
 
     // ---------- 定时提醒（需 timers 实例 + 会话上下文） ----------
@@ -228,7 +242,15 @@ const describeCapabilities = (hot) => {
       + '搜不到就如实说不知道，绝对不要编造；回答时若用了搜索结果，请顺带说明信息大致日期。'
       + '⚠ 给 web_search 的查询词要短（2~4 个核心词，如「苏州 雾霾 预警」），'
       + '写完整句子或加年份/日期/「实时」「最新」会让搜索引擎退化成无关页面。'
+      + '⚠ 搜人物/赛事优先用中文名并带项目/战队/赛事限定（如「崔祐齐 LoL 世界赛」），'
+      + '光用一个易撞名的英文 ID（Zeus 之类）会混进神话/游戏服务器等同名噪声页，看着命中却查不到有效内容。'
       + weatherPart);
+  }
+  // 读网页正文能力边界必须与 schemas 一致：开了才提示模型可用 read_url 打开链接补深度数据
+  if (readUrlActive(hot)) {
+    parts.push('你可以用 read_url 打开一个网页链接读正文全文：当 web_search 只给了标题+摘要、拿不到你要的具体数据（比分/日期/名单/原文条款）时，'
+      + '从搜索结果给出的「链接」里挑最相关的一条调用 read_url 打开再答；'
+      + '若返回读不到（反爬/纯 JS 渲染/超时）就换一条链接或如实说查不到，绝不编造网页内容。');
   }
   // 提醒能力边界必须与 schemas() 一致：开了就要教会模型“必须真建表”，否则它会口头答应却不创建
   if (hot.reminderEnabled) {
@@ -263,4 +285,4 @@ const describeCapabilities = (hot) => {
   return parts.join('\n');
 };
 
-module.exports = { create, describeCapabilities, imagegenActive, imageSearchActive, weather, websearch, timers: timersLib, imagegen: imagegenLib, imagesearch: imagesearchLib };
+module.exports = { create, describeCapabilities, imagegenActive, imageSearchActive, readUrlActive, weather, websearch, timers: timersLib, imagegen: imagegenLib, imagesearch: imagesearchLib, readpage: readpageLib };

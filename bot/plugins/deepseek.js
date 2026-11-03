@@ -223,6 +223,7 @@ module.exports = (ctx, config = {}) => {
   logger.info(`[模式] ${hot.atOnly ? '严格@（群里只有被@才回应）' : '常规（@/关键词/引用/活跃窗口）'}；连发合并 ${hot.mergeWindowMs > 0 ? Math.round(hot.mergeWindowMs / 1000) + 's' : '关'}；mentionOnly=${mentionOnly}`);
   logger.info(`[生图] ${toolsLib.imagegenActive(hot) ? `开：${hot.imagegenModel} @ ${hot.imagegenBase}（限额 全局${hot.imagegenMaxPerDay || '不限'}/天、会话${hot.imagegenMaxPerChat || '不限'}/天）` : '关（未配齐 BOT_IMAGEGEN_ENABLED/BASE/MODEL/KEY）'}`);
   logger.info(`[搜图] ${toolsLib.imageSearchActive(hot) ? `开（首选拿图：搜图→逐张视觉核对至多 ${hot.imageSearchVerifyMax} 张→契合才发；生图为兜底）` : '关（BOT_IMAGE_SEARCH_ENABLED 未开）'}`);
+  logger.info(`[读页] ${toolsLib.readUrlActive(hot) ? `开（read_url 打开 web_search 结果里的链接读正文，补摘要没有的深度数据；单次最多 ${hot.readUrlMaxChars} 字/${Math.round(hot.readUrlTimeoutMs / 1000)}s 超时）` : '关（BOT_READURL_ENABLED 未开）'}`);
   logger.info(`[状态] 目录 ${stateDir}（历史 ${histories.size} 个会话已恢复；${usageSummary()}）`);
 
   // ---------- 图片识别：deepseek-flash 原生多模态，但要求 OpenAI 兼容的 content 块数组 ----------
@@ -339,6 +340,10 @@ module.exports = (ctx, config = {}) => {
     for (;;) {
       // 最后一轮不再下发 tools，强制模型基于已拿到的内容给出文字答案，防止无限循环。
       const tools = round < hot.searchMaxRounds ? hub.schemas(opts.excludeTools) : [];
+      // 工具轮要给足 token：推理模型（deepseek-flash）得把“读完搜索→决定调哪个工具+参数”想完才会吐结构化调用，
+      //   正文上限 300 会把没吐完的工具调用截断成残缺 content，反而把内部标记泄漏给用户（11-03 实测）。
+      //   只有末轮（不下发 tools）才用 hot.maxTokens 收短最终自然语言回复。
+      const turnMaxTokens = tools.length ? Math.max(hot.maxTokens || 0, 2000) : hot.maxTokens;
       const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -350,7 +355,7 @@ module.exports = (ctx, config = {}) => {
           messages: working,
           temperature: 0.7,
           stream: false,
-          ...(hot.maxTokens > 0 ? { max_tokens: hot.maxTokens } : {}),
+          ...(turnMaxTokens > 0 ? { max_tokens: turnMaxTokens } : {}),
           ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
         }),
         // 超时不重试：避免「其实已生成/已发送」时重复刷屏
@@ -372,9 +377,15 @@ module.exports = (ctx, config = {}) => {
       const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
 
       if (!calls.length) {
-        const text = msg.content || payload?.choices?.[0]?.text || '';
-        if (!text) throw new Error('DeepSeek returned an empty response');
-        return { text: String(text).trim(), usage, searched };
+        const rawText = String(msg.content || payload?.choices?.[0]?.text || '');
+        // 兜底：推理模型偶发把工具调用以内部标记（DSML invoke 一类）漏进 content（工具轮被 max_tokens
+        //   截断、或末轮没绑到工具却仍想调 read_url 时）。这种标记绝不是给用户看的正文，判为本轮没答上，走外层兜底文案。
+        if (rawText.includes('\uFF5C\uFF5C')) {
+          logger.warn(`[工具] content 含模型内部工具标记（疑似调用泄漏），丢弃本轮 round=${round}`);
+          throw new Error('DeepSeek leaked tool-call markup into content');
+        }
+        if (!rawText) throw new Error('DeepSeek returned an empty response');
+        return { text: rawText.trim(), usage, searched };
       }
 
       // 模型可能一次发多个 tool_calls（实测会并行发两三个），逐个回填。

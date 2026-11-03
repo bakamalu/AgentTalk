@@ -75,7 +75,9 @@ const bingSearch = async (query, { maxResults, timeoutMs }) => {
   for (const block of html.split(/<li\s+class="b_algo/).slice(1)) {
     const title = cleanFragment((block.match(/<h2[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/) || [, ''])[1]);
     const snippet = cleanFragment((block.match(/<p[^>]*>([\s\S]*?)<\/p>/) || [, ''])[1]);
-    if (title || snippet) items.push({ title: title.slice(0, 80), snippet: snippet.slice(0, 260) });
+    // 结果真实链接（11-03 加）：暴露给模型，配合 read_url 打开摘要里没有的深度数据。
+    const url = cleanFragment((block.match(/<h2[^>]*>[\s\S]*?<a[^>]*?href="([^"]+)"/) || [, ''])[1]).replace(/&amp;/g, '&');
+    if (title || snippet) items.push({ title: title.slice(0, 80), snippet: snippet.slice(0, 260), url: /^https?:\/\//i.test(url) ? url : '' });
     if (items.length >= maxResults) break;
   }
   return items;
@@ -114,7 +116,7 @@ const cacheSet = (key, value) => {
 };
 
 const format = (query, items) => `搜索「${query}」结果：\n`
-  + items.map((it, i) => `${i + 1}. ${it.title}\n   ${it.snippet}`).join('\n');
+  + items.map((it, i) => `${i + 1}. ${it.title}\n   ${it.snippet}${it.url ? `\n   链接：${it.url}` : ''}`).join('\n');
 
 // 返回 { text, queries, hits, cached }，text 直接作为 tool 消息内容回填给模型
 const search = async (rawQuery, opts = {}) => {

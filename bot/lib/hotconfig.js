@@ -67,6 +67,9 @@ const DEFAULTS = {
   IMAGE_SEARCH_ENABLED: false, // 关键词搜图（首选拿图方式，生图为兜底）；开了才下发 search_image
   IMAGE_SEARCH_MAX_CANDIDATES: 5, // 一次搜几张候选图
   IMAGE_SEARCH_VERIFY_MAX: 3,     // 最多逐张视觉核对几张（都不契合→生图兜底）
+  READURL_ENABLED: false,         // 读网页正文（read_url）：默认关（会对任意 URL 发起出网请求，需显式开）
+  READURL_MAX_CHARS: 4000,        // 抽出的正文最多回给模型多少字符（防烧 token）
+  READURL_TIMEOUT_MS: 12000,      // 打开单个网页的超时
   IMAGEGEN_PROTOCOL: 'dashscope', // dashscope（百炼原生，wan/qwen 实测同步可用）| openai（标准 /images/generations）
   IMAGEGEN_ENDPOINT: '',          // 仅 dashscope 需覆盖时填完整 URL；空=由 base 推 origin 拼原生路径
 };
@@ -114,6 +117,7 @@ const HOT_KEYS = [
   'BOT_IMAGEGEN_PROTOCOL', 'BOT_IMAGEGEN_ENDPOINT',
   'BOT_PRICE_IMAGE_PER',
   'BOT_IMAGE_SEARCH_ENABLED', 'BOT_IMAGE_SEARCH_MAX_CANDIDATES', 'BOT_IMAGE_SEARCH_VERIFY_MAX',
+  'BOT_READURL_ENABLED', 'BOT_READURL_MAX_CHARS', 'BOT_READURL_TIMEOUT_MS',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -163,6 +167,7 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_IMAGEGEN_PROTOCOL: config.imagegenProtocol, BOT_IMAGEGEN_ENDPOINT: config.imagegenEndpoint,
       BOT_PRICE_IMAGE_PER: config.priceImagePer,
       BOT_IMAGE_SEARCH_ENABLED: config.imageSearchEnabled, BOT_IMAGE_SEARCH_MAX_CANDIDATES: config.imageSearchMaxCandidates, BOT_IMAGE_SEARCH_VERIFY_MAX: config.imageSearchVerifyMax,
+      BOT_READURL_ENABLED: config.readUrlEnabled, BOT_READURL_MAX_CHARS: config.readUrlMaxChars, BOT_READURL_TIMEOUT_MS: config.readUrlTimeoutMs,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -248,6 +253,10 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.imageSearchEnabled = truthy(pick('BOT_IMAGE_SEARCH_ENABLED'));
     hot.imageSearchMaxCandidates = Math.max(1, numOr('BOT_IMAGE_SEARCH_MAX_CANDIDATES', DEFAULTS.IMAGE_SEARCH_MAX_CANDIDATES));
     hot.imageSearchVerifyMax = Math.max(1, numOr('BOT_IMAGE_SEARCH_VERIFY_MAX', DEFAULTS.IMAGE_SEARCH_VERIFY_MAX));
+    // 读网页正文（read_url，见 lib/readpage.js）：默认关（出网打任意 URL 的能力，须显式开）。
+    hot.readUrlEnabled = truthy(pick('BOT_READURL_ENABLED'));
+    hot.readUrlMaxChars = Math.max(500, numOr('BOT_READURL_MAX_CHARS', DEFAULTS.READURL_MAX_CHARS) || DEFAULTS.READURL_MAX_CHARS);
+    hot.readUrlTimeoutMs = Math.max(2000, numOr('BOT_READURL_TIMEOUT_MS', DEFAULTS.READURL_TIMEOUT_MS) || DEFAULTS.READURL_TIMEOUT_MS);
     return true;
   };
 
