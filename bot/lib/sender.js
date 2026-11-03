@@ -155,7 +155,36 @@ const create = ({ logger, hot, limits = {} }) => {
     return true;
   };
 
-  return { send, notify, allowSend, rateState, rateDesc };
+  // ---------- 发送一张图片（生图等产物）----------
+  // 路由与 send 同口径：群必须走 sendGroupMsg（段数组 [image,(text)]），私聊走 sendPrivateMsg。
+  // file 是 OneBot 图片段 data.file 的值：远程 URL，或 base64://<数据>。
+  // 失败只记日志、返回布尔（不抛），交调用方（tools.generate_image）兑底告知用户。
+  const sendImage = async (session, file, caption = '') => {
+    const bot = session.bot;
+    const f = String(file || '').trim();
+    if (!f) return false;
+    const text = String(caption || '').trim();
+    const segs = [{ type: 'image', data: { file: f } }];
+    if (text) segs.push({ type: 'text', data: { text } });
+    try {
+      if (session.guildId) {
+        const groupId = session.channelId || session.guildId;
+        if (bot?.internal?.sendGroupMsg) await bot.internal.sendGroupMsg(groupId, segs);
+        else await session.send(segs);
+      } else if (bot?.internal?.sendPrivateMsg) {
+        await bot.internal.sendPrivateMsg(session.userId, segs);
+      } else {
+        await session.send(segs);
+      }
+      logger.info(`[生图投递] guild=${session.guildId || '-'} user=${session.userId || '-'} file=${f.slice(0, 48)}`);
+      return true;
+    } catch (error) {
+      logger.warn(`[生图投递] 失败: ${String(error?.message || error).slice(0, 140)}`);
+      return false;
+    }
+  };
+
+  return { send, notify, sendImage, allowSend, rateState, rateDesc };
 };
 
 module.exports = { create };

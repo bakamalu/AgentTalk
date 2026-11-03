@@ -57,7 +57,7 @@ module.exports = (ctx, config = {}) => {
     priceIn: Number(process.env.BOT_PRICE_INPUT_PER_M ?? 1),   // 元 / 百万 input tokens
     priceOut: Number(process.env.BOT_PRICE_OUTPUT_PER_M ?? 2), // 元 / 百万 output tokens（未命中缓存口径）
   });
-  const { histories, getHistory, pushHistory, scheduleSave, recordUsage, usageSummary } = store;
+  const { histories, getHistory, pushHistory, scheduleSave, recordUsage, recordImage, usageSummary } = store;
   const sender = senderLib.create({
     logger,
     hot,
@@ -68,7 +68,7 @@ module.exports = (ctx, config = {}) => {
       splitMaxParts: config.splitMaxParts,
     },
   });
-  const { send: sendReply, allowSend, notify } = sender;
+  const { send: sendReply, allowSend, notify, sendImage } = sender;
   // ---------- 定时提醒（lib/timers.js）----------
   // 到点默认走「完整延迟代理轮」：把这条提醒当指令，经 enqueue(chatKey) 与该会话实时消息串行，
   // 重跑 callDeepSeek+工具，真的去查天气/搜索/@人，再把结果用 sender.notify 投出去（群可 @）。
@@ -221,6 +221,7 @@ module.exports = (ctx, config = {}) => {
   logger.info(`[大任务校验] ${hot.bigTaskGuard ? `开（命中【动作+对象】如“编写…程序”/“做个…游戏”，或大工程短语即玩笑回绝、不进模型；动作${hot.bigTaskActions.length}词/对象${hot.bigTaskObjects.length}词/短语${hot.bigTaskKeywords.length}条；命中回复「${hot.bigTaskReply}」）` : '关（一切请求照常进模型）'}`);
   logger.info(`[上下文] @前群聊上下文 ${hot.groupContextMax > 0 ? `最近 ${hot.groupContextMax} 条/${Math.round(hot.groupContextMs / 1000)}s` : '关'}；@后免@活跃窗口 ${hot.activeWindowMs > 0 ? Math.round(hot.activeWindowMs / 1000) + 's' : '关'}`);
   logger.info(`[模式] ${hot.atOnly ? '严格@（群里只有被@才回应）' : '常规（@/关键词/引用/活跃窗口）'}；连发合并 ${hot.mergeWindowMs > 0 ? Math.round(hot.mergeWindowMs / 1000) + 's' : '关'}；mentionOnly=${mentionOnly}`);
+  logger.info(`[生图] ${toolsLib.imagegenActive(hot) ? `开：${hot.imagegenModel} @ ${hot.imagegenBase}（限额 全局${hot.imagegenMaxPerDay || '不限'}/天、会话${hot.imagegenMaxPerChat || '不限'}/天）` : '关（未配齐 BOT_IMAGEGEN_ENABLED/BASE/MODEL/KEY）'}`);
   logger.info(`[状态] 目录 ${stateDir}（历史 ${histories.size} 个会话已恢复；${usageSummary()}）`);
 
   // ---------- 图片识别：deepseek-flash 原生多模态，但要求 OpenAI 兼容的 content 块数组 ----------
@@ -616,7 +617,14 @@ module.exports = (ctx, config = {}) => {
     ];
 
     try {
-      const result = await callDeepSeek(messages, { chatKey, userId: String(session.userId ?? '') });
+      const result = await callDeepSeek(messages, {
+        chatKey,
+        userId: String(session.userId ?? ''),
+        // 生图工具产物直接发图：绑当前 session，群/私聊路由由 lib/sender.sendImage 处理
+        sendImage: (file, caption) => sendImage(session, file, caption),
+        // 生图计费：发图成功后按张记入与 token 同级的“生图账本”（单价 hot.priceImagePer 元/张）
+        billImage: (count) => recordImage(chatKey, { count, unitPrice: hot.priceImagePer }),
+      });
       const badWord = hitSensitive(result.text);
       if (badWord) {
         logger.info(`[敏感词] 输出命中「${badWord}」，回复已拦截（${chatKey}）`);

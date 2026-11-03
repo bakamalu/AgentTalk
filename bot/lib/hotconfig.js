@@ -54,6 +54,18 @@ const DEFAULTS = {
   // 非纯文本消息段（音乐/分享/文件/视频/卡片/未知类型…）备注注入 + 未知段遥测（见 lib/segments.js）：默认开。
   //   关掉则不再向模型描述“卡片/媒体”段、也不打遥测日志（但 @/图片/语音等既有行为不受影响）。
   SEG_NOTES: true,
+  // 文生图（OpenAI 兼容 /images/generations，见 lib/imagegen.js + lib/tools.js 的 generate_image）：
+  //   默认关（要外部 key、且花额度，必须显式开）。开且配齐 base/model/key 才下发工具，否则能力边界自动说“画不了”。
+  IMAGEGEN_ENABLED: false,
+  IMAGEGEN_BASE: '',
+  IMAGEGEN_MODEL: '',
+  IMAGEGEN_SIZE: '',          // 空=不下发 size，走服务端默认（万相默认 1024*1024）
+  IMAGEGEN_TIMEOUT_MS: 90000, // 生图慢，给足超时（默认 90s）
+  IMAGEGEN_MAX_PER_DAY: 30,   // 全局每日上限（0=不限）
+  IMAGEGEN_MAX_PER_CHAT: 5,   // 单会话每日上限（0=不限）
+  PRICE_IMAGE_PER: 0,         // 生图单价（元/张）：与 token 记账同级的独立账本；0=只记张数不计费
+  IMAGEGEN_PROTOCOL: 'dashscope', // dashscope（百炼原生，wan/qwen 实测同步可用）| openai（标准 /images/generations）
+  IMAGEGEN_ENDPOINT: '',          // 仅 dashscope 需覆盖时填完整 URL；空=由 base 推 origin 拼原生路径
 };
 
 // 名单：空 = null（语义是“不限制”，不是“全部拒绝”）
@@ -94,6 +106,10 @@ const HOT_KEYS = [
   'BOT_BIGTASK_GUARD', 'BOT_BIGTASK_ACTIONS', 'BOT_BIGTASK_OBJECTS', 'BOT_BIGTASK_KEYWORDS', 'BOT_BIGTASK_REPLY',
   'BOT_FORWARD_ENABLED', 'BOT_FORWARD_MAX_NODES', 'BOT_FORWARD_MAX_CHARS', 'BOT_FORWARD_MAX_DEPTH',
   'BOT_MAX_TOKENS', 'BOT_SEG_NOTES',
+  'BOT_IMAGEGEN_ENABLED', 'BOT_IMAGEGEN_BASE', 'BOT_IMAGEGEN_MODEL', 'BOT_IMAGEGEN_KEY',
+  'BOT_IMAGEGEN_SIZE', 'BOT_IMAGEGEN_TIMEOUT_MS', 'BOT_IMAGEGEN_MAX_PER_DAY', 'BOT_IMAGEGEN_MAX_PER_CHAT',
+  'BOT_IMAGEGEN_PROTOCOL', 'BOT_IMAGEGEN_ENDPOINT',
+  'BOT_PRICE_IMAGE_PER',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -136,6 +152,12 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_FORWARD_MAX_CHARS: config.forwardMaxChars, BOT_FORWARD_MAX_DEPTH: config.forwardMaxDepth,
       BOT_MAX_TOKENS: config.maxTokens,
       BOT_SEG_NOTES: config.segNotes,
+      BOT_IMAGEGEN_ENABLED: config.imagegenEnabled, BOT_IMAGEGEN_BASE: config.imagegenBase,
+      BOT_IMAGEGEN_MODEL: config.imagegenModel, BOT_IMAGEGEN_KEY: config.imagegenKey,
+      BOT_IMAGEGEN_SIZE: config.imagegenSize, BOT_IMAGEGEN_TIMEOUT_MS: config.imagegenTimeoutMs,
+      BOT_IMAGEGEN_MAX_PER_DAY: config.imagegenMaxPerDay, BOT_IMAGEGEN_MAX_PER_CHAT: config.imagegenMaxPerChat,
+      BOT_IMAGEGEN_PROTOCOL: config.imagegenProtocol, BOT_IMAGEGEN_ENDPOINT: config.imagegenEndpoint,
+      BOT_PRICE_IMAGE_PER: config.priceImagePer,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -205,6 +227,19 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.maxTokens = numOr('BOT_MAX_TOKENS', DEFAULTS.MAX_TOKENS);
     // 非文本段备注+遥测开关：默认开（空=开）。
     hot.segNotes = pick('BOT_SEG_NOTES') === '' ? true : truthy(pick('BOT_SEG_NOTES'));
+    // 生图：默认关（空=false，与其他默认开的项不同：要外部 key+花额度，必须显式开）。
+    //   base/model/key 任一缺失 → tools.imagegenActive=false → 不下发工具且能力边界说“画不了”。
+    hot.imagegenEnabled = truthy(pick('BOT_IMAGEGEN_ENABLED'));
+    hot.imagegenBase = pick('BOT_IMAGEGEN_BASE').trim();
+    hot.imagegenModel = pick('BOT_IMAGEGEN_MODEL').trim();
+    hot.imagegenKey = pick('BOT_IMAGEGEN_KEY').trim();
+    hot.imagegenSize = pick('BOT_IMAGEGEN_SIZE').trim();
+    hot.imagegenTimeoutMs = Math.max(5000, numOr('BOT_IMAGEGEN_TIMEOUT_MS', DEFAULTS.IMAGEGEN_TIMEOUT_MS) || DEFAULTS.IMAGEGEN_TIMEOUT_MS);
+    hot.imagegenMaxPerDay = numOr('BOT_IMAGEGEN_MAX_PER_DAY', DEFAULTS.IMAGEGEN_MAX_PER_DAY);
+    hot.imagegenMaxPerChat = numOr('BOT_IMAGEGEN_MAX_PER_CHAT', DEFAULTS.IMAGEGEN_MAX_PER_CHAT);
+    hot.imagegenProtocol = (pick('BOT_IMAGEGEN_PROTOCOL').trim() || DEFAULTS.IMAGEGEN_PROTOCOL).toLowerCase();
+    hot.imagegenEndpoint = pick('BOT_IMAGEGEN_ENDPOINT').trim();
+    hot.priceImagePer = Math.max(0, numOr('BOT_PRICE_IMAGE_PER', DEFAULTS.PRICE_IMAGE_PER));
     return true;
   };
 

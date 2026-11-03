@@ -48,7 +48,7 @@ const create = ({ stateDir, logger, maxTurns = 8, priceIn = 1, priceOut = 2 }) =
   };
 
   // ---------- token 用量：按日/按会话累计，按官方价折算 ----------
-  const usage = readJson(usageFile, { days: {}, chats: {}, total: { input: 0, output: 0, calls: 0 } });
+  const usage = readJson(usageFile, { days: {}, chats: {}, total: { input: 0, output: 0, calls: 0, images: 0, imageCost: 0 } });
   const recordUsage = (chatKey, u) => {
     if (!u) return;
     const day = new Date().toISOString().slice(0, 10);
@@ -68,17 +68,37 @@ const create = ({ stateDir, logger, maxTurns = 8, priceIn = 1, priceOut = 2 }) =
     writeJson(usageFile, usage);
     logger.info(`[用量] ${chatKey} in=${u.prompt_tokens} out=${u.completion_tokens} 今日成本≈${usage.days[day].cost.toFixed(4)}元`);
   };
+  // ---------- 生图用量：单独一本账，与 token 同级并列（按张计 + 按每张单价折元）----------
+  // 单价由调用方按当时 hot 传入（store 不读配置），未定价时 cost=0、但张数照记。
+  const recordImage = (chatKey, { count = 1, unitPrice = 0 } = {}) => {
+    const c = Math.max(0, Number(count) || 0);
+    if (!c) return;
+    const day = new Date().toISOString().slice(0, 10);
+    if (!usage.days[day]) usage.days[day] = { input: 0, output: 0, cost: 0 };
+    if (!usage.chats[chatKey]) usage.chats[chatKey] = { input: 0, output: 0, cost: 0, calls: 0 };
+    const cost = c * (Number(unitPrice) || 0);
+    usage.days[day].images = (usage.days[day].images || 0) + c;
+    usage.days[day].imageCost = (usage.days[day].imageCost || 0) + cost;
+    usage.chats[chatKey].images = (usage.chats[chatKey].images || 0) + c;
+    usage.chats[chatKey].imageCost = (usage.chats[chatKey].imageCost || 0) + cost;
+    usage.total.images = (usage.total.images || 0) + c;
+    usage.total.imageCost = (usage.total.imageCost || 0) + cost;
+    writeJson(usageFile, usage);
+    logger.info(`[用量-图] ${chatKey} +${c}张 今日${usage.days[day].images}张≈${usage.days[day].imageCost.toFixed(4)}元（累计 ${usage.total.images} 张≈${usage.total.imageCost.toFixed(4)}元）`);
+  };
   const usageSummary = () => {
     const day = new Date().toISOString().slice(0, 10);
     const d = usage.days[day] || { input: 0, output: 0, cost: 0 };
-    return `今日 in=${d.input} out=${d.output} ≈${d.cost.toFixed(3)}元；累计 ${usage.total.calls} 次调用 in=${usage.total.input} out=${usage.total.output}`;
+    const base = `今日 in=${d.input} out=${d.output} ≈${d.cost.toFixed(3)}元；累计 ${usage.total.calls} 次调用 in=${usage.total.input} out=${usage.total.output}`;
+    const img = `；今日生图 ${d.images || 0} 张≈${(d.imageCost || 0).toFixed(3)}元（累计 ${usage.total.images || 0} 张≈${(usage.total.imageCost || 0).toFixed(3)}元）`;
+    return base + img;
   };
 
   return {
     stateDir, historiesFile, usageFile,
     readJson, writeJson,
     histories, getHistory, pushHistory, scheduleSave,
-    recordUsage, usageSummary,
+    recordUsage, recordImage, usageSummary,
   };
 };
 
