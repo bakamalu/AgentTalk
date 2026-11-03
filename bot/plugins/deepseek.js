@@ -10,6 +10,7 @@
 //   lib/quote.js      引用原文三层兜底（adapter → internal.getMsg → 直连 WS）
 //   lib/tools.js      工具注册表：能力在这里挂载与分发
 //   lib/timers.js     定时提醒（到点可 @ 指定人）：提醒表/持久化/到点调度
+//   lib/persona.js    人格 / 活人感：内置默认 prompt 与 few-shot 示例轮（BOT_FEWSHOT_ENABLED 热开关）
 //   lib/weather.js    天气（Open-Meteo 免 key，兜底 wttr.in）
 //   lib/websearch.js  联网搜索（Bing 免 key + 查询词治理 + 结果质量闸）
 //
@@ -23,6 +24,7 @@ const senderLib = require('../lib/sender');
 const quoteLib = require('../lib/quote');
 const toolsLib = require('../lib/tools');
 const timersLib = require('../lib/timers');
+const persona = require('../lib/persona');
 
 const { DEFAULTS } = hotconfig;
 
@@ -92,6 +94,7 @@ module.exports = (ctx, config = {}) => {
           + '⚠ 现在不是设表时机，绝对不要新建/取消/列出提醒；也不要谎称之前已经提醒过。';
         const messages = [
           { role: 'system', content: `${hot.systemPrompt}\n${timeLine()}\n${toolsLib.describeCapabilities(hot)}` },
+          ...persona.fewShotTurns(hot),
           ...history.map(({ role, content, senderId }) => ({
             role,
             content: role === 'user' && senderId ? '[用户 ' + senderId + '] ' + content : content,
@@ -416,7 +419,7 @@ module.exports = (ctx, config = {}) => {
         `定时提醒：${hot.reminderEnabled ? `开，待触发 ${timers.pendingCount()} 个（${hot.reminderExec ? '到点重跑模型执行任务' : '到点仅发固定文案'}；群聊默认@设表人，@上限 ${hot.reminderMaxAt} 人，单会话≤${hot.reminderMaxPerChat} 个）` : '关'}`,
         `大任务校验：${hot.bigTaskGuard ? `开（命中【动作+对象】如“编写…程序”/“做个…游戏”，或大工程短语即玩笑回绝、不进模型）` : '关'}`,
         `热重载：${botEnvFile}（2~5 秒自动生效，无需重启）`,
-        `当前人格：${hot.systemPrompt.slice(0, 40)}`,
+        `当前人格：${persona.labelOf(hot.personaId)}（few-shot ${hot.fewShotEnabled ? '开' : '关'}；可切 ${persona.listPersonas().map((p) => p.id).join('/')}，改 BOT_PERSONA 热生效）`,
       ];
       logger.info(`[管理员] ${userId} 查询状态`);
       sendReply(session, lines.join('\n')).catch(() => {});
@@ -547,6 +550,7 @@ module.exports = (ctx, config = {}) => {
     // 能力描述要和实际下发的工具一致（见 lib/tools.describeCapabilities）。
     const messages = [
       { role: 'system', content: `${hot.systemPrompt}\n${timeLine()}\n${toolsLib.describeCapabilities(hot)}` },
+      ...persona.fewShotTurns(hot),
       ...history.map(({ role, content, senderId }) => ({
         role,
         content: role === 'user' && senderId ? '[用户 ' + senderId + '] ' + content : content,

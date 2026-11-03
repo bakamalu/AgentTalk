@@ -7,11 +7,18 @@
 //   表现是“改了值却不热生效”，只能靠重启时的 process.env 兜底——10-30 踩过。
 
 const fs = require('fs');
+const persona = require('./persona');
 
 const DEFAULTS = {
   // 唤醒关键词（BOT_AT_ONLY=1 的严格@模式下不参与判定）
   TRIGGER_KEYWORDS: ['ai', 'bot', '机器人', 'deepseek', 'deepseek机器人'],
-  SYSTEM_PROMPT: '你是一个友好的中文助手，回答简洁自然，适合在 QQ 聊天中使用。',
+  // 内置默认人格来自 lib/persona.js 的注册表（多行、带换行，塞不进单行 bot.env）；
+  // 这里取“代码默认人格”的 prompt 作为兼容默认值，prod 里 BOT_SYSTEM_PROMPT 留空即按激活人格回落。
+  SYSTEM_PROMPT: persona.systemPromptOf(persona.DEFAULT_PERSONA_ID),
+  // 默认激活人格 id（代码级）；要用 bot.env 热切写 BOT_PERSONA=<id>。
+  PERSONA: persona.DEFAULT_PERSONA_ID,
+  // few-shot 示例注入开关（各人格自带 fewShot，见 lib/persona.js）：默认开，关掉则完全不注入示例轮。
+  FEWSHOT_ENABLED: true,
   ACTIVE_WINDOW_MS: 120000,   // 被@后免@连续对话时长（0=关闭）
   GROUP_CONTEXT_MS: 120000,   // @前上下文取多久以内的群消息（0=关闭）
   GROUP_CONTEXT_MAX: 6,       // @前上下文最多几条
@@ -63,7 +70,7 @@ const hashText = (s) => { let h = 0; for (let i = 0; i < s.length; i++) h = (h *
 const HOT_KEYS = [
   'BOT_ALLOWED_USERS', 'BOT_ALLOWED_GROUPS', 'BOT_BLACKLIST_USERS', 'BOT_BLACKLIST_GROUPS',
   'BOT_ADMIN_USERS', 'BOT_ADMIN_GROUP', 'BOT_SENSITIVE_WORDS', 'BOT_SENSITIVE_NOTIFY',
-  'BOT_QUOTE_REPLY', 'BOT_SYSTEM_PROMPT', 'BOT_AT_ONLY',
+  'BOT_QUOTE_REPLY', 'BOT_SYSTEM_PROMPT', 'BOT_PERSONA', 'BOT_FEWSHOT_ENABLED', 'BOT_AT_ONLY',
   'BOT_ACTIVE_WINDOW_MS', 'BOT_GROUP_CONTEXT_MS', 'BOT_GROUP_CONTEXT_MAX',
   'BOT_MERGE_WINDOW_MS', 'BOT_MERGE_MAX_WAIT_MS',
   'BOT_IMAGE_ENABLED', 'BOT_IMAGE_MAX', 'BOT_IMAGE_TIMEOUT_MS',
@@ -96,7 +103,7 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_BLACKLIST_USERS: config.blacklistedUsers, BOT_BLACKLIST_GROUPS: config.blacklistedGroups,
       BOT_ADMIN_USERS: config.adminUsers, BOT_ADMIN_GROUP: config.adminGroup,
       BOT_SENSITIVE_WORDS: config.sensitiveWords, BOT_SENSITIVE_NOTIFY: config.sensitiveNotify,
-      BOT_QUOTE_REPLY: config.quoteReply, BOT_SYSTEM_PROMPT: config.systemPrompt, BOT_AT_ONLY: config.atOnly,
+      BOT_QUOTE_REPLY: config.quoteReply, BOT_SYSTEM_PROMPT: config.systemPrompt, BOT_PERSONA: config.persona, BOT_AT_ONLY: config.atOnly,
       BOT_ACTIVE_WINDOW_MS: config.activeWindowMs, BOT_GROUP_CONTEXT_MS: config.groupContextMs,
       BOT_GROUP_CONTEXT_MAX: config.groupContextMax,
       BOT_MERGE_WINDOW_MS: config.mergeWindowMs, BOT_MERGE_MAX_WAIT_MS: config.mergeMaxWaitMs,
@@ -126,7 +133,12 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.sensitiveNotify = truthy(pick('BOT_SENSITIVE_NOTIFY'));
     hot.quoteReply = truthy(pick('BOT_QUOTE_REPLY'));
     hot.atOnly = truthy(pick('BOT_AT_ONLY'));
-    hot.systemPrompt = pick('BOT_SYSTEM_PROMPT') || DEFAULTS.SYSTEM_PROMPT;
+    // 人格切换：BOT_PERSONA 选激活人格（非法值回落到代码默认）；必须在 systemPrompt 之前定好。
+    hot.personaId = persona.resolveId(pick('BOT_PERSONA'));
+    // 人格 prompt：BOT_SYSTEM_PROMPT 显式自定义（单行）优先；留空则用激活人格自带的多行 prompt。
+    hot.systemPrompt = pick('BOT_SYSTEM_PROMPT') || persona.systemPromptOf(hot.personaId);
+    // few-shot 注入：默认开（空=开），与其他布尔项同口径。
+    hot.fewShotEnabled = pick('BOT_FEWSHOT_ENABLED') === '' ? true : truthy(pick('BOT_FEWSHOT_ENABLED'));
     hot.activeWindowMs = numOr('BOT_ACTIVE_WINDOW_MS', DEFAULTS.ACTIVE_WINDOW_MS);
     hot.groupContextMs = numOr('BOT_GROUP_CONTEXT_MS', DEFAULTS.GROUP_CONTEXT_MS);
     hot.groupContextMax = Math.min(20, numOr('BOT_GROUP_CONTEXT_MAX', DEFAULTS.GROUP_CONTEXT_MAX));
