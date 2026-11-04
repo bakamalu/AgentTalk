@@ -162,155 +162,242 @@ const create = ({ logger, api = null, wsEndpoint = 'ws://127.0.0.1:3001', wsToke
 
   // ---------- 引用周边对话检索（仅群聊）：被引用消息为锚点拉回话题小段落作背景 ----------
   //   chatSelect(prompt) 由插件注入（走接口队列的小请求），返回模型答复文本；失败/缺席时 fallback 用确定性信号。
-  //   返回 { block, count, historyBlock, from, to, picked } 或 null；historyBlock 是给会话历史留的
+  //   返回 { block, count, historyBlock, from, to, picked, hops, pulls } 或 null；historyBlock 是给会话历史留的
   //   压缩存档（见 opts.historyMaxChars），本轮输入仍用全量 block，两者不叠加喂。
   //   任何环节失败都不阻断本轮主回复，但必须留一行原因日志——
   //   11-03 该特性上线后一直“看不出效果”，就是因为失败路径全部静默 return null，日志里只剩启动行，
   //   分不清“这轮压根没有引用”还是“检索跑了但没料”。
+  //   引用链上溯（opts.hopMax，11-04 下午加）：用户常拿「自己引用过别人」的那条来追问，锚点周围只剩他自己的空话
+  //   （15:38 实测：锚点=「这件事的前因后果你描述下呢」，窗内只有他和机器人 → 2 行/70 字，于是回了句「真没有记录」；
+  //   真料在他 13:11 那条「你怎么看」所引用的 11-02 17:05 那段里）。背景太薄时就沿窗内他自己的 [CQ:reply] 换个更旧的
+  //   锚点重跑一轮。跳数上限只是深度闸（用户口径“允许多跳，最多 10 次”），兜时间的是 hopBudgetMs：
+  //   出池的那一跳要再问两次网关（实测 ~2.4s/批），十跳全问就是 24s，会把整轮回复拖死；目标已在池里的跳免费。
   const retrieveAroundQuote = async (session, quoteMsgId, opts = {}) => {
-    const { seedId, chainMs, maxMs, maxChars, historyMaxChars, fetchCount, fmtTime, timeoutMs } = opts;
+    const { seedId, chainMs, maxMs, maxChars, historyMaxChars, fetchCount, fmtTime, timeoutMs,
+      hopMax, hopMinLines, hopBudgetMs, archiveMinLines } = opts;
     const gid = String((session.guildId && (session.event?.group_id ?? session.guildId)) || session.guildId || '');
     if (!gid || !quoteMsgId || (seedId == null || seedId === '')) {
       logger.info(`[引用检索] 跳过：${!gid ? '拿不到群号（非群聊？）' : !quoteMsgId ? '没拿到被引用消息 id' : '没拿到引用发送人标识'}`);
       return null;
     }
+    const gidNum = Number(gid) || gid;
+    // 不写死 TIMEOUT_MS：没显式给超时就交给助手读热配置默认值（BOT_GW_TIMEOUT_MS）
+    const baseTimeout = Number(timeoutMs) > 0 ? Number(timeoutMs) : 0;
+    // 上溯/存档门槛：opts 没给就等于关掉，维持 11-04 之前的行为（老调用点和单测不受影响）
+    const maxHops = Math.max(0, Number(hopMax) || 0);
+    const thinLines = Math.max(1, Number(hopMinLines) || 3);
+    const budgetMs = Math.max(2000, Number(hopBudgetMs) || 10000);
+    const hopDeadline = Date.now() + budgetMs;
+    const hMax = Number(historyMaxChars) || 0;
+    const aMin = Math.max(0, Number(archiveMinLines) || 0);
+    const pool = new Map(); // 消息池跨跳共享（key=message_id）：上溯的目标常已在这批分页里，那种跳是免费的
+    const visited = new Set([String(quoteMsgId)]); // 当过锚点的就不再去，防 A↔B 互引打转
+    let pulls = 0;
+    let pullMs = 0;
     // 按网关文档的锚点分页取群历史（get_group_msg_history: group_id + message_id + count + reverse_order）：
     //   reverse_order=true 给「锚点及更旧」，=false 给「锚点及更新」，两次并发（同一条连接按 echo 复用），
     //   正好铺满滑动窗口两侧。旧口径只拉「最近 N 条」，锚点稍旧一点就整段落空
     //   （11-03 20:10 那轮 17:05 的发言被 20:10 引用，就是这个原因拿不到料）。
-    const anchorNum = Number(quoteMsgId);
-    // 不写死 TIMEOUT_MS：没显式给超时就交给助手读热配置默认值（BOT_GW_TIMEOUT_MS）
-    const apiOpts = Number(timeoutMs) > 0 ? { timeoutMs: Number(timeoutMs) } : {};
-    const pageOf = (reverseOrder) => gateway.callApi(session, 'get_group_msg_history',
-      { group_id: Number(gid) || gid, message_id: anchorNum, count: fetchCount, reverse_order: reverseOrder }, apiOpts);
-    let olderRes; let newerRes;
-    try {
-      [olderRes, newerRes] = await Promise.all([pageOf(true), pageOf(false)]);
-    } catch (error) {
-      logger.warn('[引用检索] get_group_msg_history 异常: ' + String(error && error.message || error).slice(0, 160));
-      return null;
-    }
     const listOf = (res) => (res && res.ok && res.data && Array.isArray(res.data.messages) ? res.data.messages : []);
-    const merged = new Map(); // 锚点会同时出现在两次返回里，按 message_id 去重
-    for (const m of [...listOf(olderRes), ...listOf(newerRes)]) {
-      if (m && m.message_id != null && !merged.has(String(m.message_id))) merged.set(String(m.message_id), m);
-    }
-    const raws = [...merged.values()];
-    if (!raws.length) {
-      const failed = [olderRes, newerRes].filter((r) => r && !r.ok);
-      const offline = failed.length > 0 && failed.every((r) => r.offline);
-      const tries = failed.reduce((n, r) => Math.max(n, Number(r.attempts) || 1), 1);
-      const why = failed.map((r) => r.error).join(' / ');
-      // 分开说才看得出下一步查什么：「网关离线」= 等重连没等到（多半撞在网关断开的那几秒窗口，
-      //   属正常抖动，不用改代码）；「网关未返回/业务失败」才是接口口径或参数的问题。
-      logger.warn(`[引用检索] ${offline
-        ? `网关离线（连不上，已在 6s 预算内重试 ${tries} 轮仍没碰上重连）`
-        : '网关未返回历史消息'}：${why.slice(0, 260) || '（返回为空）'}`);
-      return null;
-    }
-    // 覆盖时段 + 走的是哪一档，是排查“检索为什么没料”的唯一线索；单侧条数上限也一并记出，
-    //   方便判断该不该调 BOT_QUOTE_CONTEXT_FETCH_COUNT（实测单侧 200 条要走 ~14s，会撞超时）
-    const tsAll = raws.map((m) => Number(m && m.time)).filter(Number.isFinite);
-    logger.info(`[引用检索] 历史 ${raws.length} 条（锚点前 ${listOf(olderRes).length}/锚点后 ${listOf(newerRes).length}，单侧上限 ${fetchCount}，走 ${olderRes.via || newerRes.via || '网关'}，耗时 ${Math.max(Number(olderRes.ms) || 0, Number(newerRes.ms) || 0)}ms${Math.max(Number(olderRes.attempts) || 1, Number(newerRes.attempts) || 1) > 1 ? `，重试 ${Math.max(Number(olderRes.attempts) || 1, Number(newerRes.attempts) || 1)} 轮` : ''}）`
-      + `${tsAll.length && fmtTime ? `，覆盖 ${fmtTime(Math.min(...tsAll) * 1000)}~${fmtTime(Math.max(...tsAll) * 1000)}` : ''}`);
-    const anchorRaw = raws.find((m) => m && Number(m.message_id) === anchorNum);
-    if (!anchorRaw) { logger.info(`[引用检索] 锚点 ${quoteMsgId} 不在网关返回的 ${raws.length} 条历史内（消息过旧或引用 id 与网关不同源），跳过`); return null; }
-    const anchorTime = Number(anchorRaw.time) || 0;
-    if (!anchorTime) { logger.info('[引用检索] 锚点消息没有时间戳，跳过'); return null; }
-    // 背景行文本：normalizeText 不抹 reply/at 段，这里手动清掉（否则 CQ 码噪声会直接喂模型）；
-    //   图片等占位符保留在 text 里，由下面的“纯占位符”过滤排掉。原始 raw 另存供 fallback 挖 reply/at。
-    const display = (s) => normalizeText(String(s || '')).replace(/\[CQ:(reply|at)[^\]]*\]/gi, ' ').replace(/\s+/g, ' ').trim();
-    const anchor = {
-      messageId: String(anchorRaw.message_id),
-      userId: String(anchorRaw.sender && anchorRaw.sender.user_id != null ? anchorRaw.sender.user_id : anchorRaw.user_id || ''),
-      username: String((anchorRaw.sender && (anchorRaw.sender.card || anchorRaw.sender.nickname)) || ''),
-      time: anchorTime,
-      text: display(anchorRaw.raw_message),
-    };
-    const msgs = raws
-      .filter((m) => m && Number.isFinite(Number(m.time)))
-      .map((m) => ({
-        messageId: String(m.message_id),
-        userId: String(m.sender && m.sender.user_id != null ? m.sender.user_id : m.user_id || ''),
-        username: String((m.sender && (m.sender.card || m.sender.nickname)) || ''),
-        time: Number(m.time),
-        text: display(m.raw_message),
-        raw: String(m.raw_message || ''),
-      }))
-      .filter((m) => m.userId && m.text && !/^(\[[^\]]*\]\s*)+$/.test(m.text));
-    // 锁定“话题主角（seed）”：以历史里锚点消息的 sender 为权威（插件传的 seedId 常只有昵称、对不上 id），
-    //   锚点 sender 拉不到时才用传入值兜底。
-    const seed = String(anchor.userId || seedId || '');
-    // ① 滑动窗口（口径 [y0-gap, y+gap]）：先沿引用发送人自己的发言双向推进，他一超过 gap 没再说话就在那儿截断
-    //   得到 [y0, y]，再首尾各垫一个 gap（别人接话总晚一拍），最后用 maxMs 封顶单侧（总跨度 ≤ 2×maxMs）。
-    const seedTimes = msgs.filter((m) => String(m.userId) === seed).map((m) => m.time);
-    const win = windowChat(seedTimes, anchorTime, chainMs, maxMs);
-    // ② 候选参与人：时段内除 seed/机器人外的发送人（按发言次数降序，至多 10 人交给 AI）
-    const bots = new Set([seed, String((session.bot && session.bot.selfId) || session.selfId || '')]);
-    const candMap = new Map();
-    for (const m of msgs) {
-      if (m.time < win.from || m.time > win.to || bots.has(m.userId)) continue;
-      const c = candMap.get(m.userId) || { id: m.userId, name: m.username || ('QQ' + m.userId), n: 0, samples: [] };
-      c.n += 1;
-      if (c.samples.length < 2) c.samples.push(m.text.slice(0, 40));
-      candMap.set(m.userId, c);
-    }
-    const cands = [...candMap.values()].sort((a, b) => b.n - a.n).slice(0, 10);
-    // 没候选不能直接 return null：时段内只有锚点发送人自己说话时，他那几轮发言仍是有用背景
-    //   （早期版本此处 return null，导致“一个人连发几条再被人引用”这种常见场景拿不到任何背景）。
-    if (!cands.length) logger.info('[引用检索] 时段内没有其他人发言，只保留锚点发送人自己的上下文');
-    // ③ 选人（结构信号优先，可解释且省掉一次模型请求）：命中任一条即算 seed 的讨论对象——
-    //   a) 引用过 seed 在该时段内的任何一条消息；b) @ 过 seed；c) 接话：seed 发完后 gap 内紧接着的那个人。
-    //   三条都没命中、且确有候选人时，才交给 AI 补判一次；AI 也判不出就只保留 seed 自己的发言。
-    const seedMsgIds = new Set(msgs.filter((m) => String(m.userId) === seed).map((m) => m.messageId));
-    const ordered = msgs.filter((m) => m.time >= win.from && m.time <= win.to).sort((x, y) => x.time - y.time);
-    const gapSec = Math.floor(chainMs / 1000);
-    const altIds = new Set();
-    ordered.forEach((m, i) => {
-      if (String(m.userId) !== seed) return;
-      const nxt = ordered[i + 1];
-      if (nxt && !bots.has(nxt.userId) && nxt.time - m.time <= gapSec) altIds.add(nxt.userId);
-    });
-    const struct = new Map();
-    for (const m of ordered) {
-      if (bots.has(m.userId) || struct.has(m.userId)) continue;
-      const { replies, ats } = replyAtIdsOf(m.raw);
-      const why = replies.some((id) => seedMsgIds.has(id)) ? '引用'
-        : (ats.includes(seed) ? '@' : (altIds.has(m.userId) ? '接话' : ''));
-      if (why) struct.set(m.userId, why);
-    }
-    let picked = [...struct.keys()];
-    if (picked.length) logger.info(`[引用检索] 结构命中 ${picked.length} 人（${[...struct.values()].join('、')}，未调模型）`);
-    // ④ 结构一个都没命中 → 才让 AI 补判一次
-    if (!picked.length && cands.length && typeof chatSelect === 'function') {
-      const prompt = [
-        '群里发生了一段对话，下面先给出被引用的一条消息，再列出候选成员及其发言条数、例子。',
-        `锚点消息（被引用）：[时间 ${fmtTime(anchorTime * 1000)} 发送人「${anchor.username || ('QQ' + seed)}」] ${anchor.text}`,
-        '候选成员：',
-        ...cands.map((c) => `- 编号${c.id} 昵称「${c.name}」 发言${c.n}条：${c.samples.join('；')}`),
-        '',
-        `问：这些候选成员里，哪些在同一时段内是与「${anchor.username || ('QQ' + seed)}」就同一话题讨论的对象？`,
-        '只回答编号（逗号分隔），都不确定就回答：无。不要解释。',
-      ].join('\n');
+    const msOf = (res) => Number(res && res.ms) || 0;
+    const attOf = (res) => Number(res && res.attempts) || 1;
+    const ensurePulled = async (anchorNum, callOpts) => {
+      if (pool.has(String(anchorNum))) return true;
+      const pageOf = (reverseOrder) => gateway.callApi(session, 'get_group_msg_history',
+        { group_id: gidNum, message_id: anchorNum, count: fetchCount, reverse_order: reverseOrder }, callOpts);
+      let olderRes; let newerRes;
       try {
-        const ans = await chatSelect(prompt);
-        // 只从“真正存在的候选 id”里取（不限制位数；模型回行号/额外数字会被自然过滤掉）
-        const digits = String(ans || '').match(/\d+/g) || [];
-        picked = cands.filter((c) => digits.includes(c.id)).map((c) => c.id);
-        if (picked.length) logger.info(`[引用检索] 结构无命中，AI 补判 ${picked.length} 人`);
+        [olderRes, newerRes] = await Promise.all([pageOf(true), pageOf(false)]);
       } catch (error) {
-        logger.warn('[引用检索] AI 补判失败，只保留锚点发送人发言: ' + String(error && error.message || error).slice(0, 120));
+        logger.warn('[引用检索] get_group_msg_history 异常: ' + String(error && error.message || error).slice(0, 160));
+        return false;
       }
+      pulls += 1;
+      pullMs += Math.max(msOf(olderRes), msOf(newerRes));
+      for (const m of [...listOf(olderRes), ...listOf(newerRes)]) {
+        if (m && m.message_id != null && !pool.has(String(m.message_id))) pool.set(String(m.message_id), m);
+      }
+      const raws = [...pool.values()];
+      if (!raws.length) {
+        const failed = [olderRes, newerRes].filter((r) => r && !r.ok);
+        const offline = failed.length > 0 && failed.every((r) => r.offline);
+        const tries = failed.reduce((acc, r) => Math.max(acc, attOf(r)), 1);
+        const why = failed.map((r) => r.error).join(' / ');
+        // 分开说才看得出下一步查什么：「网关离线」= 等重连没等到（多半撞在网关断开的那几秒窗口，
+        //   属正常抖动，不用改代码）；「网关未返回/业务失败」才是接口口径或参数的问题。
+        logger.warn(`[引用检索] ${offline
+          ? `网关离线（连不上，已在 ${Math.round((baseTimeout || 6000) / 1000)}s 预算内重试 ${tries} 轮仍没碰上重连）`
+          : '网关未返回历史消息'}：${why.slice(0, 260) || '（返回为空）'}`);
+        return false;
+      }
+      // 覆盖时段 + 走的是哪一档，是排查“检索为什么没料”的唯一线索；单侧条数上限也一并记出，
+      //   方便判断该不该调 BOT_QUOTE_CONTEXT_FETCH_COUNT（实测单侧 200 条要走 ~14s，会撞超时）
+      const triesMax = Math.max(attOf(olderRes), attOf(newerRes));
+      const tsAll = raws.map((m) => Number(m && m.time)).filter(Number.isFinite);
+      logger.info(`[引用检索] ${pulls > 1 ? `上溯补拉 #${pulls}（锚点 ${anchorNum}）：` : ''}历史 ${raws.length} 条（锚点前 ${listOf(olderRes).length}/锚点后 ${listOf(newerRes).length}，单侧上限 ${fetchCount}，走 ${(olderRes && olderRes.via) || (newerRes && newerRes.via) || '网关'}，耗时 ${Math.max(msOf(olderRes), msOf(newerRes))}ms${triesMax > 1 ? `，重试 ${triesMax} 轮` : ''}）`
+        + `${tsAll.length && fmtTime ? `，覆盖 ${fmtTime(Math.min(...tsAll) * 1000)}~${fmtTime(Math.max(...tsAll) * 1000)}` : ''}`);
+      return true;
+    };
+    // 跑一跳：圈窗 → 挑讨论对象 → 组装。返回 null = 这一跳没跑出可用背景（原因已在上面落日志）。
+    //   mark 决定谁被标 [被引用]：永远是「用户这次真引用的那条」（quoteMsgId），中游那条不冒充它 ——
+    //   否则模型会把上游那段当成用户引用的内容来复述；裁剪的“就近”才按当前锚点时间算。
+    const attemptAt = async (anchorNum, depth, callOpts) => {
+      if (!(await ensurePulled(anchorNum, callOpts))) return null;
+      const raws = [...pool.values()];
+      const anchorRaw = raws.find((m) => m && Number(m.message_id) === anchorNum);
+      if (!anchorRaw) { logger.info(`[引用检索] 锚点 ${anchorNum} 不在网关返回的 ${raws.length} 条历史内（消息过旧或引用 id 与网关不同源），跳过`); return null; }
+      const anchorTime = Number(anchorRaw.time) || 0;
+      if (!anchorTime) { logger.info('[引用检索] 锚点消息没有时间戳，跳过'); return null; }
+      // 背景行文本：normalizeText 不抹 reply/at 段，这里手动清掉（否则 CQ 码噪声会直接喂模型）；
+      //   图片等占位符保留在 text 里，由下面的“纯占位符”过滤排掉。原始 raw 另存供 fallback 挖 reply/at。
+      const display = (s) => normalizeText(String(s || '')).replace(/\[CQ:(reply|at)[^\]]*\]/gi, ' ').replace(/\s+/g, ' ').trim();
+      const anchor = {
+        messageId: String(anchorRaw.message_id),
+        userId: String(anchorRaw.sender && anchorRaw.sender.user_id != null ? anchorRaw.sender.user_id : anchorRaw.user_id || ''),
+        username: String((anchorRaw.sender && (anchorRaw.sender.card || anchorRaw.sender.nickname)) || ''),
+        time: anchorTime,
+        text: display(anchorRaw.raw_message),
+      };
+      const mark = { messageId: String(quoteMsgId), time: anchorTime };
+      const msgs = raws
+        .filter((m) => m && Number.isFinite(Number(m.time)))
+        .map((m) => ({
+          messageId: String(m.message_id),
+          userId: String(m.sender && m.sender.user_id != null ? m.sender.user_id : m.user_id || ''),
+          username: String((m.sender && (m.sender.card || m.sender.nickname)) || ''),
+          time: Number(m.time),
+          text: display(m.raw_message),
+          raw: String(m.raw_message || ''),
+        }))
+        .filter((m) => m.userId && m.text && !/^(\[[^\]]*\]\s*)+$/.test(m.text));
+      // 锁定“话题主角（seed）”：以历史里当前锚点消息的 sender 为权威（插件传的 seedId 常只有昵称、对不上 id），
+      //   拉不到时才用传入值兜底。上溯的那跳 seed 跟着换成被引原话的发送人 —— 要还原的正是他那一段对话。
+      const seed = String(anchor.userId || seedId || '');
+      // ① 滑动窗口（口径 [y0-gap, y+gap]）：先沿锚点发送人自己的发言双向推进，他一超过 gap 没再说话就在那儿截断
+      //   得到 [y0, y]，再首尾各垫一个 gap（别人接话总晚一拍），最后用 maxMs 封顶单侧（总跨度 ≤ 2×maxMs）。
+      const seedTimes = msgs.filter((m) => String(m.userId) === seed).map((m) => m.time);
+      const win = windowChat(seedTimes, anchorTime, chainMs, maxMs);
+      // ② 候选参与人：时段内除 seed/机器人外的发送人（按发言次数降序，至多 10 人交给 AI）
+      const bots = new Set([seed, String((session.bot && session.bot.selfId) || session.selfId || '')]);
+      const candMap = new Map();
+      for (const m of msgs) {
+        if (m.time < win.from || m.time > win.to || bots.has(m.userId)) continue;
+        const c = candMap.get(m.userId) || { id: m.userId, name: m.username || ('QQ' + m.userId), n: 0, samples: [] };
+        c.n += 1;
+        if (c.samples.length < 2) c.samples.push(m.text.slice(0, 40));
+        candMap.set(m.userId, c);
+      }
+      const cands = [...candMap.values()].sort((a, b) => b.n - a.n).slice(0, 10);
+      // 没候选不能直接 return null：时段内只有锚点发送人自己说话时，他那几轮发言仍是有用背景
+      //   （早期版本此处 return null，导致“一个人连发几条再被人引用”这种常见场景拿不到任何背景）。
+      if (!cands.length) logger.info('[引用检索] 时段内没有其他人发言，只保留锚点发送人自己的上下文');
+      // ③ 选人（结构信号优先，可解释且省掉一次模型请求）：命中任一条即算 seed 的讨论对象——
+      //   a) 引用过 seed 在该时段内的任何一条消息；b) @ 过 seed；c) 接话：seed 发完后 gap 内紧接着的那个人。
+      //   三条都没命中、且确有候选人时，才交给 AI 补判一次；AI 也判不出就只保留 seed 自己的发言。
+      const seedMsgIds = new Set(msgs.filter((m) => String(m.userId) === seed).map((m) => m.messageId));
+      const ordered = msgs.filter((m) => m.time >= win.from && m.time <= win.to).sort((x, y) => x.time - y.time);
+      const gapSec = Math.floor(chainMs / 1000);
+      const altIds = new Set();
+      ordered.forEach((m, idx) => {
+        if (String(m.userId) !== seed) return;
+        const nxt = ordered[idx + 1];
+        if (nxt && !bots.has(nxt.userId) && nxt.time - m.time <= gapSec) altIds.add(nxt.userId);
+      });
+      const struct = new Map();
+      for (const m of ordered) {
+        if (bots.has(m.userId) || struct.has(m.userId)) continue;
+        const { replies, ats } = replyAtIdsOf(m.raw);
+        const why = replies.some((id) => seedMsgIds.has(id)) ? '引用'
+          : (ats.includes(seed) ? '@' : (altIds.has(m.userId) ? '接话' : ''));
+        if (why) struct.set(m.userId, why);
+      }
+      let picked = [...struct.keys()];
+      if (picked.length) logger.info(`[引用检索] 结构命中 ${picked.length} 人（${[...struct.values()].join('、')}，未调模型）`);
+      // ④ 结构一个都没命中 → 才让 AI 补判一次（上溯的跳预算紧就不陪跑：一次补判 0.5~6s，不如把时间留给多翻一跳）
+      if (!picked.length && cands.length && typeof chatSelect === 'function') {
+        if (depth > 0 && Date.now() + 4000 >= hopDeadline) {
+          logger.info(`[引用检索] 上溯第 ${depth} 跳跳过 AI 补判（检索预算只剩 ${Math.max(0, hopDeadline - Date.now())}ms）`);
+        } else {
+          const prompt = [
+            '群里发生了一段对话，下面先给出被引用的一条消息，再列出候选成员及其发言条数、例子。',
+            `锚点消息（被引用）：[时间 ${fmtTime(anchorTime * 1000)} 发送人「${anchor.username || ('QQ' + seed)}」] ${anchor.text}`,
+            '候选成员：',
+            ...cands.map((c) => `- 编号${c.id} 昵称「${c.name}」 发言${c.n}条：${c.samples.join('；')}`),
+            '',
+            `问：这些候选成员里，哪些在同一时段内是与「${anchor.username || ('QQ' + seed)}」就同一话题讨论的对象？`,
+            '只回答编号（逗号分隔），都不确定就回答：无。不要解释。',
+          ].join('\n');
+          try {
+            const ans = await chatSelect(prompt);
+            // 只从“真正存在的候选 id”里取（不限制位数；模型回行号/额外数字会被自然过滤掉）
+            const digits = String(ans || '').match(/\d+/g) || [];
+            picked = cands.filter((c) => digits.includes(c.id)).map((c) => c.id);
+            if (picked.length) logger.info(`[引用检索] 结构无命中，AI 补判 ${picked.length} 人`);
+          } catch (error) {
+            logger.warn('[引用检索] AI 补判失败，只保留锚点发送人发言: ' + String(error && error.message || error).slice(0, 120));
+          }
+        }
+      }
+      if (!picked.length) { logger.info('[引用检索] 未识别到讨论对象（结构与 AI 都没命中），仅保留锚点发送人发言'); }
+      // ⑤ 组装背景块（seed + 命中参与人，超限优先留靠近锚点的）
+      const res = assembleLines(msgs, seed, picked, win, mark, maxChars, fmtTime);
+      if (!res.count || !res.block) { logger.info('[引用检索] 组装后背景块为空（窗内只有锚点自身或全被占位符过滤）'); return null; }
+      // 压缩存档：同一个组装函数按更小的字数上限重裁（超限时本来就是「靠近锚点的优先留」，正好适合当摘要）。
+      //   不另写一套裁剪逻辑，免得两边口径漂移；存档 ≤ 全量时用全量，等于白裁。
+      const historyBlock = hMax > 0 ? (hMax >= maxChars ? res.block : assembleLines(msgs, seed, picked, win, mark, hMax, fmtTime).block) : '';
+      // ⑥ 给下一跳备好上游：窗内「锚点发送人自己」的消息引用的更旧那条，从靠近锚点的开始试。
+      //   不追别人消息拉的链 —— 那是别人的话题，翻过去背景就跑偏了。
+      const upstream = [];
+      for (let i = ordered.length - 1; i >= 0; i--) {
+        const m = ordered[i];
+        if (String(m.userId) !== seed) continue;
+        for (const rid of replyAtIdsOf(m.raw).replies) {
+          const id = String(rid);
+          if (visited.has(id) || upstream.includes(id)) continue;
+          const known = pool.get(id);
+          if (known && Number(known.time) >= anchorTime) continue; // 只往更旧的方向翻
+          upstream.push(id);
+        }
+      }
+      return { depth, count: res.count, block: res.block, historyBlock, picked, from: win.from, to: win.to, upstream };
+    };
+    // 一跳超时收进剩余预算（上溯是锦上添花：网关正断窗时宁可少拿一段背景，也不把整轮回复拖死）。
+    //   没显式给 timeoutMs 时，单跳按 4s 封顶（够盖实测的 2.4s 双分页），不去撑大 BOT_GW_TIMEOUT_MS。
+    const callOptsOf = (depth) => {
+      if (depth === 0) return baseTimeout > 0 ? { timeoutMs: baseTimeout } : {};
+      const left = hopDeadline - Date.now();
+      return { timeoutMs: Math.max(1200, Math.min(baseTimeout > 0 ? baseTimeout : 4000, left)) };
+    };
+    let best = null;
+    let depth = 0;
+    let cursor = Number(quoteMsgId);
+    for (;;) {
+      const at = await attemptAt(cursor, depth, callOptsOf(depth));
+      if (!at) break;
+      // 平手取更深的：越上游越是真话题（第一跳往往只剩用户自己的两句追问）
+      if (!best || at.count >= best.count) best = at;
+      if (at.count >= thinLines || at.picked.length) break; // 够料立刻停，多一跳就多一批网关调用
+      if (!maxHops) break;
+      if (depth >= maxHops) { logger.info(`[引用检索] 背景只有 ${at.count} 行，但已到上溯跳数上限 ${maxHops}（BOT_QUOTE_CONTEXT_HOP_MAX）`); break; }
+      if (Date.now() >= hopDeadline) { logger.info(`[引用检索] 背景只有 ${at.count} 行，但上溯预算 ${budgetMs}ms 用尽（已拉 ${pulls} 批/${pullMs}ms），就此打住`); break; }
+      const next = at.upstream[0];
+      if (!next) { logger.info(`[引用检索] 背景只有 ${at.count} 行，但窗内没有更早的引用可上溯（引用链到头）`); break; }
+      visited.add(next);
+      depth += 1;
+      logger.info(`[引用检索] 背景只有 ${at.count} 行，沿引用链上溯第 ${depth} 跳：锚点 ${next}（预算余 ${Math.max(0, hopDeadline - Date.now())}ms）`);
+      cursor = Number(next);
     }
-    if (!picked.length) { logger.info('[引用检索] 未识别到讨论对象（结构与 AI 都没命中），仅保留锚点发送人发言'); }
-    // ④ 组装背景块（seed + 命中参与人，超限优先留靠近锚点的）
-    const res = assembleLines(msgs, seed, picked, win, anchor, maxChars, fmtTime);
-    if (!res.count || !res.block) { logger.info('[引用检索] 组装后背景块为空（窗内只有锚点自身或全被占位符过滤）'); return null; }
-    // 压缩存档：同一个组装函数按更小的字数上限重裁（超限时本来就是「靠近锚点的优先留」，正好适合当摘要）。
-    //   不另写一套裁剪逻辑，免得两边口径漂移；存档 ≤ 全量时用全量，等于白裁。
-    const hMax = Number(historyMaxChars) || 0;
-    const historyBlock = hMax > 0 ? (hMax >= maxChars ? res.block : assembleLines(msgs, seed, picked, win, anchor, hMax, fmtTime).block) : '';
-    return { block: res.block, count: res.count, historyBlock, from: win.from, to: win.to, picked };
+    if (!best) return null;
+    if (best.depth) logger.info(`[引用检索] 采用上溯第 ${best.depth} 跳的背景 ${best.count} 行（本轮共问网关 ${pulls} 批/${pullMs}ms）`);
+    // 薄背景不落存档（11-04 15:38）：那 2 行是「你怎么看 / 这件事的前因后果你描述下呢」这种元问题，
+    //   沉进历史后每轮重复喂一遍、还让模型误以为“有记录”。认出讨论对象的短背景是真对话，照旧落。
+    //   门槛填 0 = 不设门槛（维持 11-04 上午的老行为）。
+    const thinArchive = aMin > 0 && best.count < aMin && !best.picked.length;
+    if (thinArchive) logger.info(`[引用检索] 存档不落：背景只有 ${best.count} 行且没认出讨论对象（门槛 ${aMin} 行）`);
+    return {
+      block: best.block, count: best.count, historyBlock: thinArchive ? '' : best.historyBlock,
+      from: best.from, to: best.to, picked: best.picked, hops: best.depth, pulls,
+    };
   };
 
   return { findRawReplyId, fetchQuoteByMsgId, maybePatchGetMessage, parseMsgPayload, retrieveAroundQuote };

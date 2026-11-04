@@ -95,6 +95,16 @@ const DEFAULTS = {
   //   所以按这个字数再存一份压缩版进会话历史（靠近锚点的优先留）；0 = 不沉淀，维持老行为。
   QUOTE_CONTEXT_HISTORY_CHARS: 400,
   QUOTE_CONTEXT_FETCH_COUNT: 60,   // 单侧条数（锚点前/锚点后各拉这么多）：实测单侧 200 条要走 ~14s（撞 6s 超时），60 条约 2.3s
+  //   引用链上溯（11-04 15:38 的修法）：背景太薄时沿「锚点发送人自己引用的更旧那条」换锚点再跑一轮。
+  //   HOP_MAX 只是深度闸（用户口径：允许多跳、最多 10 次），真正兜时间的是 HOP_BUDGET_MS —— 出池的一跳要再问两次
+  //   网关（实测 ~2.4s/批），全按 10 跳问就是 24s，会把整轮回复拖死；目标已在消息池里的那些跳不花网关时间。
+  //   行数够 HOP_MIN_LINES 或认出了讨论对象就立刻停。HOP_MAX=0 = 不上溯（维持 11-04 上午的行为）。
+  QUOTE_CONTEXT_HOP_MAX: 10,
+  QUOTE_CONTEXT_HOP_MIN_LINES: 3,      // 背景薄到不足几行才值得往引用链上游再找
+  QUOTE_CONTEXT_HOP_BUDGET_MS: 10000,  // 上溯阶段（第一跳之后）总共允许花掉的时间
+  //   存档门槛：只有一两行、又没认出讨论对象的薄背景多半是「你怎么看 / 前因后果描述下」这种元问题，
+  //   沉进会话历史就是每轮重复计费 + 让模型误以为“有记录”。0 = 不设门槛（维持 11-04 上午的老行为）。
+  QUOTE_CONTEXT_ARCHIVE_MIN_LINES: 3,
   // 网关动作调用（lib/onebot.js callApi）：一次调用的总预算，与「连不上」时的重试间隔。
   //   SnowLuma 那侧的 QQ 会话会周期性重登，每次把 3001 关掉 5~18 秒（11-04 实测：发作时每 1~5 分钟一次），
   //   检索撞在窗口里就会“取不到历史”，所以预算内要等重连。预算 ≥ 断窗长度才盖得住：
@@ -160,6 +170,8 @@ const HOT_KEYS = [
   'BOT_REPLY_INTENT_CHECK', 'BOT_NOT_MINE_WORDS', 'BOT_NOT_MINE_REPLY', 'BOT_INTENT_TIMEOUT_MS',
   'BOT_QUOTE_CONTEXT_ENABLED', 'BOT_QUOTE_CONTEXT_CHAIN_MS', 'BOT_QUOTE_CONTEXT_MAX_MS',
   'BOT_QUOTE_CONTEXT_MAX_CHARS', 'BOT_QUOTE_CONTEXT_HISTORY_CHARS', 'BOT_QUOTE_CONTEXT_FETCH_COUNT',
+  'BOT_QUOTE_CONTEXT_HOP_MAX', 'BOT_QUOTE_CONTEXT_HOP_MIN_LINES',
+  'BOT_QUOTE_CONTEXT_HOP_BUDGET_MS', 'BOT_QUOTE_CONTEXT_ARCHIVE_MIN_LINES',
   'BOT_GW_TIMEOUT_MS', 'BOT_GW_RETRY_INTERVAL_MS',
   'BOT_NOTICE_ENABLED', 'BOT_NOTICE_MAX_CHARS', 'BOT_NOTICE_COOLDOWN_MS', 'BOT_NOTICE_ALLOW_GROUP_ADMIN',
 ];
@@ -217,6 +229,9 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_QUOTE_CONTEXT_MAX_MS: config.quoteContextMaxMs, BOT_QUOTE_CONTEXT_MAX_CHARS: config.quoteContextMaxChars,
       BOT_QUOTE_CONTEXT_HISTORY_CHARS: config.quoteContextHistoryChars,
       BOT_QUOTE_CONTEXT_FETCH_COUNT: config.quoteContextFetchCount,
+      BOT_QUOTE_CONTEXT_HOP_MAX: config.quoteContextHopMax, BOT_QUOTE_CONTEXT_HOP_MIN_LINES: config.quoteContextHopMinLines,
+      BOT_QUOTE_CONTEXT_HOP_BUDGET_MS: config.quoteContextHopBudgetMs,
+      BOT_QUOTE_CONTEXT_ARCHIVE_MIN_LINES: config.quoteContextArchiveMinLines,
       BOT_GW_TIMEOUT_MS: config.gatewayTimeoutMs, BOT_GW_RETRY_INTERVAL_MS: config.gatewayRetryIntervalMs,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
@@ -323,6 +338,18 @@ const create = ({ config, logger, botEnvFile }) => {
     const hcv = pick('BOT_QUOTE_CONTEXT_HISTORY_CHARS');
     hot.quoteContextHistoryChars = hcv === '' || !Number.isFinite(Number(hcv))
       ? DEFAULTS.QUOTE_CONTEXT_HISTORY_CHARS : Math.min(1500, Math.max(0, Number(hcv)));
+    // 上溯跳数与存档门槛都能填 0（0 = 不上溯 / 不设门槛），所以同样不能套 `|| DEFAULT`（0 会被默认值顶掉）。
+    const hmv = pick('BOT_QUOTE_CONTEXT_HOP_MAX');
+    hot.quoteContextHopMax = hmv === '' || !Number.isFinite(Number(hmv))
+      ? DEFAULTS.QUOTE_CONTEXT_HOP_MAX : Math.max(0, Math.min(10, Number(hmv)));
+    hot.quoteContextHopMinLines = Math.max(1, Math.min(10,
+      numOr('BOT_QUOTE_CONTEXT_HOP_MIN_LINES', DEFAULTS.QUOTE_CONTEXT_HOP_MIN_LINES) || DEFAULTS.QUOTE_CONTEXT_HOP_MIN_LINES));
+    const hbv = pick('BOT_QUOTE_CONTEXT_HOP_BUDGET_MS');
+    hot.quoteContextHopBudgetMs = hbv === '' || !Number.isFinite(Number(hbv))
+      ? DEFAULTS.QUOTE_CONTEXT_HOP_BUDGET_MS : Math.min(30000, Math.max(2000, Number(hbv)));
+    const amv = pick('BOT_QUOTE_CONTEXT_ARCHIVE_MIN_LINES');
+    hot.quoteContextArchiveMinLines = amv === '' || !Number.isFinite(Number(amv))
+      ? DEFAULTS.QUOTE_CONTEXT_ARCHIVE_MIN_LINES : Math.max(0, Math.min(10, Number(amv)));
     // 网关调用预算/重试：retry 间隔允许填 0（=关重试），所以不能用 `|| DEFAULT` 兜（0 会被吃掉）。
     hot.gatewayTimeoutMs = Math.max(1000, Math.min(20000, numOr('BOT_GW_TIMEOUT_MS', DEFAULTS.GATEWAY_TIMEOUT_MS) || DEFAULTS.GATEWAY_TIMEOUT_MS));
     hot.gatewayRetryIntervalMs = Math.min(5000, numOr('BOT_GW_RETRY_INTERVAL_MS', DEFAULTS.GATEWAY_RETRY_INTERVAL_MS));
