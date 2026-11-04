@@ -108,6 +108,30 @@
 
 调用位置：`bot/lib/forward.js` 的 `fetchNodes()`。
 
+### `get_group_member_info` / `_send_group_notice` —— 群身份与群公告（#公告 指令用）
+
+`get_group_member_info`：`group_id + user_id + no_cache`，返回里的 **`role` 只有 `owner`/`admin`/`member` 三种**
+（11-04 实测同一个群里机器人是 `member`、提问的人是 `owner`）。**发公告前必须先查它**：QQ 只让群主/管理员发公告，
+`member` 去发必被拒 —— 先查再发才能把「我在你们群只是普通成员，先把我提上去」这种人话回给用户，而不是等腾讯报错。
+
+`_send_group_notice`（官方 catalog 参数）：`group_id`、`content` 必填；`image`（本地路径/URL/base64）、
+`pinned=0|1` 是否置顶、`type=1 普通 / 20 新成员公告`（catalog 自己建议改用 `send_to_new_members`）、
+`is_show_edit_card=1`、`ti…`（截断，完整看 catalog）。
+我们只接了 `group_id + content + pinned`（`bot/lib/notice.js`）：公告是**全员弹窗**，每多接一个参数就多一分误发面积。
+
+实测注意：
+
+1. `get_supported_actions` 回 **retcode=1404（未实现）** —— 别指望开机自检「这版网关到底支持哪些动作」，
+   只能照文档名字直接调、失败时把 retmsg 记全；
+2. `_get_group_notice`（读群公告）retcode=0、正常返回数组（没有公告时是 `[]`）——说明公告这族动作在 SnowLuma 侧是通的，
+   「发不出去」基本等于**身份不够**，不要先怀疑接口缺失；
+3. 这两个动作都走 `callApi` 第一档 `internal._get(action, params)` 就通（adapter 没给它们生成驼峰方法，
+   按方法名去找会像 11-03 那样静默失效）。
+4. 本项目的入口是管理员指令 `#公告`（`bot/plugins/deepseek.js` 的 `handleAdminCommand` → `bot/lib/notice.js`），
+   **刻意没做成模型工具**：公告会推送/弹窗给全群，不能让模型自己决定发不发。所以「引用一句 + 说声发公告」
+   是发不出去的（那句会当普通聊天进模型，日志里 `工具=未调用`）；指令要求 `#公告` 出现在正文最前面
+   （@ 会被洗成空格，所以 `@机器人 #公告 …` 与 `#公告 … @机器人` 都能识别）。
+
 ## 三、网关抖动口径（实测数字，写容错前先读）
 
 SnowLuma 侧的 QQ 会话会**周期性重登**，它自己日志里一轮长这样：

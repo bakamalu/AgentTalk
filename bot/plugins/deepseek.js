@@ -27,6 +27,7 @@ const onebotLib = require('../lib/onebot');
 const quoteLib = require('../lib/quote');
 const segLib = require('../lib/segments');
 const forwardLib = require('../lib/forward');
+const noticeLib = require('../lib/notice');
 const toolsLib = require('../lib/tools');
 const timersLib = require('../lib/timers');
 const persona = require('../lib/persona');
@@ -254,6 +255,8 @@ module.exports = (ctx, config = {}) => {
     wsEndpoint,
     wsToken,
   });
+  // 群公告（管理员指令 #公告）：复用已连的网关，权限与限流规则全在 lib/notice.js
+  const notices = noticeLib.create({ logger, hot, api: gateway });
   logger.info(`[网关] 动作助手就绪：优先复用 adapter 连接（internal._get），兜底直连 ${wsEndpoint}（token ${wsToken ? '已配' : '未配 → 兜底档会握手失败'}）；`
     + `单次预算 ${hot.gatewayTimeoutMs}ms，连不上时每 ${hot.gatewayRetryIntervalMs}ms 重试一轮${hot.gatewayRetryIntervalMs ? '' : '（重试已关）'}——`
     + `网关侧 QQ 会话会周期性重登、每次断开 5~18 秒，撞上了就靠这个等回来（预算要 ≥ 断窗长度才盖得住）`);
@@ -327,6 +330,8 @@ module.exports = (ctx, config = {}) => {
   const describe = (set, emptyText) => (set ? `仅 ${[...set].join(',')}` : emptyText);
   const countText = (set) => (set ? `${set.size} 个` : '未设置');
   logger.info(`[白名单] 私聊 ${describe(hot.allowedUsers, '不限制(全部放行)')}；群聊 ${describe(hot.allowedGroups, '不限制(所有群，需 @)')}`);
+  logger.info(`[公告] 管理员指令 #公告 ${hot.noticeEnabled ? `开（正文≤${hot.noticeMaxChars}字；同群 ${Math.round(hot.noticeCooldownMs / 1000)}s 内一条；触发${hot.noticeAllowGroupAdmin ? '：名单内或该群群主/管理员' : '：仅 BOT_ADMIN_USERS 名单内'}）` : '关（BOT_NOTICE_ENABLED=0）'}；`
+      + '机器人自己在那个群不是群主/管理员时 QQ 会拒发（发送前先查 role，失败会回成人话而不是静默）');
   logger.info(`[管理员] ${describe(hot.adminUsers, '未设置(特权指令不可用)')}；生效范围 ${hot.adminGroup ? '私聊+群聊(@机器人)' : '仅私聊'}`);
   logger.info(`[黑名单] 用户 ${countText(hot.blacklistedUsers)}；群 ${countText(hot.blacklistedGroups)}（优先于白名单，命中即拒）`);
   logger.info(`[敏感词] ${hot.sensitiveWords.length ? hot.sensitiveWords.length + ' 个词已启用' : '未启用'}；引用回复 ${hot.quoteReply ? '开' : '关'}`);
@@ -651,19 +656,70 @@ module.exports = (ctx, config = {}) => {
 
   // ---------- 管理员特权指令：不进模型队列，立即响应 ----------
   // 私聊直接发；群里被 @ 时去掉 @ 后也能触发（未 @ 收不到，无需特判）
+
+  // ---------- 群公告（#公告）执行体 ----------
+  // 发送本身要过网关两次（查我自己的 role → _send_group_notice），可能等几秒，所以指令判断保持同步、
+  //   这儿 fire-and-forget：成不成都回一句给用户，失败原因直接用 notice.js 里写好人话的 why。
+  const runNotice = async (session, notice, { isGroup, selfId, userId }) => {
+    const r = await notices.sendNotice({
+      session, groupId: notice.groupId, content: notice.content, pinned: notice.pinned, selfId,
+    });
+    if (r.ok) {
+      logger.info(`[公告] ${userId} 发布成功（群 ${r.groupId}，${r.pinned ? '置顶' : '普通'}，耗时 ${r.ms}ms）`);
+      const ell = notice.content.length > r.brief.length ? '…' : '';
+      sendReply(session, `公告已发${r.pinned ? '（置顶）' : ''}：${r.brief}${ell}`).catch(() => {});
+      return;
+    }
+    logger.warn(`[公告] ${userId} 被拒：${r.why}`);
+    sendReply(session, `公告没发出去：${r.why}`).catch(() => {});
+  };
+  // BOT_NOTICE_ALLOW_GROUP_ADMIN=1 才会走到这儿：名单外的发送者得先是该群的群主/管理员（role 现查网关）
+  const runNoticeAsGroupAdmin = async (session, notice, { selfId, userId }) => {
+    const gid = String(session.guildId || '');
+    const who = await notices.roleOf(session, gid, userId);
+    if (!who.ok) {
+      logger.warn(`[公告] 查 ${userId} 在群 ${gid} 的身份失败：${who.error}`);
+      sendReply(session, '公告没发出去：查你在群里的身份失败了。').catch(() => {});
+      return;
+    }
+    if (!notices.ROLE_OK.has(who.role)) {
+      logger.info(`[公告] ${userId} 在群 ${gid} 是 ${who.role || '未知'}，无权发公告`);
+      sendReply(session, '公告只有群主或群管理员能让元芳发——你在这个群里不是。').catch(() => {});
+      return;
+    }
+    await runNotice(session, notice, { isGroup: true, selfId, userId });
+  };
+
   const handleAdminCommand = (session, text) => {
     if (!hot.adminUsers) return false;
     const userId = String(session.userId ?? '');
     if (hot.blacklistedUsers && hot.blacklistedUsers.has(userId)) return false;
-    if (!hot.adminUsers.has(userId)) return false;
 
     // 默认管理员指令仅私聊生效；adminGroup 开启后群里可用（需 @机器人，去掉 @ 后匹配指令）
     const isGroup = Boolean(session.guildId);
-    if (isGroup) {
-      if (!hot.adminGroup) return false;
-      const selfId = String(session.bot?.selfId || session.selfId || '');
-      text = text.replace(new RegExp('@' + selfId, 'g'), '').trim();
+    const selfId = String(session.bot?.selfId || session.selfId || '');
+    if (isGroup) text = text.replace(new RegExp('@' + selfId, 'g'), '').trim();
+
+    // 群公告的触发口径单独一条（其它指令继续走下面的 adminUsers/adminGroup 双闸）：
+    //   A) BOT_ADMIN_USERS 名单内（群里仍要求 BOT_ADMIN_GROUP=1，与 #状态/#重置 同口径）；
+    //   B) BOT_NOTICE_ALLOW_GROUP_ADMIN=1 时该群的群主/管理员也能发（role 得问网关，异步核验）。
+    //   两条都不满足就 return false —— 这条消息交给模型，它会按能力边界老实说「没这个工具」。
+    const notice = notices.parseCommand(text, { isGroup });
+    if (notice) {
+      const listed = hot.adminUsers.has(userId) && (!isGroup || hot.adminGroup);
+      if (!listed && !(isGroup && hot.noticeAllowGroupAdmin)) return false;
+      if (notice.kind === 'help') {
+        sendReply(session, `公告没发：${notice.why}\n${notices.helpText({ isGroup })}`).catch(() => {});
+        return true;
+      }
+      const args = { isGroup, selfId, userId };
+      const job = listed ? runNotice(session, notice, args) : runNoticeAsGroupAdmin(session, notice, args);
+      job.catch((error) => logger.warn('[公告] 执行异常: ' + error.message));
+      return true;
     }
+
+    if (!hot.adminUsers.has(userId)) return false;
+    if (isGroup && !hot.adminGroup) return false;
 
     if (/^(#|＃)?重置(对话|上下文|记忆)?$/i.test(text) || /^\/reset$/i.test(text)) {
       const chatKey = `${session.platform || 'onebot'}:${session.guildId || 'private'}:${session.channelId || ''}:${session.userId}`;
@@ -688,6 +744,7 @@ module.exports = (ctx, config = {}) => {
         `图片识别：${hot.enableImage ? `开（单条最多 ${hot.imageMax} 张，base64 内联）` : '关'}`,
         `联网能力：搜索 ${hot.searchEnabled ? `开（${hot.searchMaxRounds} 轮 × ${hot.searchMaxResults} 条）` : '关'}；天气 ${hot.weatherEnabled ? `开（默认城市 ${hot.weatherDefaultCity || '无'}）` : '关'}`,
         `定时提醒：${hot.reminderEnabled ? `开，待触发 ${timers.pendingCount()} 个（${hot.reminderExec ? '到点重跑模型执行任务' : '到点仅发固定文案'}；群聊默认@设表人，@上限 ${hot.reminderMaxAt} 人，单会话≤${hot.reminderMaxPerChat} 个）` : '关'}`,
+        `群公告：${hot.noticeEnabled ? `开（#公告 正文≤${hot.noticeMaxChars}字、同群${Math.round(hot.noticeCooldownMs / 1000)}s一条；${hot.noticeAllowGroupAdmin ? '名单内或该群群主/管理员可触发' : '仅名单内可触发'}）` : '关'},机器人需在目标群是群主/管理员才发得出`,
         `大任务校验：${hot.bigTaskGuard ? `开（命中【动作+对象】如“编写…程序”/“做个…游戏”，或大工程短语即玩笑回绝、不进模型）` : '关'}`,
         `热重载：${botEnvFile}（2~5 秒自动生效，无需重启）`,
         `当前人格：${persona.labelOf(hot.personaId)}（few-shot ${hot.fewShotEnabled ? '开' : '关'}；可切 ${persona.listPersonas().map((p) => p.id).join('/')}，改 BOT_PERSONA 热生效）`,

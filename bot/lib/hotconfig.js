@@ -102,6 +102,13 @@ const DEFAULTS = {
   GATEWAY_TIMEOUT_MS: 6000,         // 总预算（1000~20000）；三档降级共用，不是每档各等一遍
                                     // 线上按实测断窗分位取 12000（p75=13s，盖 73% 的窗），见 config/bot.env.example
   GATEWAY_RETRY_INTERVAL_MS: 1200,  // 离线重试间隔；0=关掉重试（只想快速失败时用）
+  // 群公告（管理员指令 #公告，见 lib/notice.js）：11-04 群里有人要机器人发公告，
+  //   它回「没有权限」——当时是真没接这个动作。接口在网关侧有（_send_group_notice），
+  //   但公告打扰全群，所以只做指令、不做模型工具，且默认按最保守口径：只认名单。
+  NOTICE_ENABLED: true,          // 关掉后 #公告 直接回「功能没开」，不再查身份、不碰网关
+  NOTICE_MAX_CHARS: 200,         // 正文字数上限（QQ 公告本身能写更长，这里刻意收紧防刷屏长文）
+  NOTICE_COOLDOWN_MS: 60000,     // 同群两条公告的最小间隔；0=不限（不建议，公告是全员弹窗）
+  NOTICE_ALLOW_GROUP_ADMIN: false, // 允许「该群的群主/管理员」触发（role 现查网关）。默认关=只认 BOT_ADMIN_USERS
   IMAGEGEN_PROTOCOL: 'dashscope', // dashscope（百炼原生，wan/qwen 实测同步可用）| openai（标准 /images/generations）
   IMAGEGEN_ENDPOINT: '',          // 仅 dashscope 需覆盖时填完整 URL；空=由 base 推 origin 拼原生路径
 };
@@ -154,6 +161,7 @@ const HOT_KEYS = [
   'BOT_QUOTE_CONTEXT_ENABLED', 'BOT_QUOTE_CONTEXT_CHAIN_MS', 'BOT_QUOTE_CONTEXT_MAX_MS',
   'BOT_QUOTE_CONTEXT_MAX_CHARS', 'BOT_QUOTE_CONTEXT_HISTORY_CHARS', 'BOT_QUOTE_CONTEXT_FETCH_COUNT',
   'BOT_GW_TIMEOUT_MS', 'BOT_GW_RETRY_INTERVAL_MS',
+  'BOT_NOTICE_ENABLED', 'BOT_NOTICE_MAX_CHARS', 'BOT_NOTICE_COOLDOWN_MS', 'BOT_NOTICE_ALLOW_GROUP_ADMIN',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -318,6 +326,14 @@ const create = ({ config, logger, botEnvFile }) => {
     // 网关调用预算/重试：retry 间隔允许填 0（=关重试），所以不能用 `|| DEFAULT` 兜（0 会被吃掉）。
     hot.gatewayTimeoutMs = Math.max(1000, Math.min(20000, numOr('BOT_GW_TIMEOUT_MS', DEFAULTS.GATEWAY_TIMEOUT_MS) || DEFAULTS.GATEWAY_TIMEOUT_MS));
     hot.gatewayRetryIntervalMs = Math.min(5000, numOr('BOT_GW_RETRY_INTERVAL_MS', DEFAULTS.GATEWAY_RETRY_INTERVAL_MS));
+    // 群公告：默认开但只认管理员名单；冷却允许填 0（=不限频），所以不能套 `|| DEFAULT`
+    //   （0 会被默认值顶掉，和 BOT_GW_RETRY_INTERVAL_MS 同一个坑）。
+    hot.noticeEnabled = pick('BOT_NOTICE_ENABLED') === '' ? true : truthy(pick('BOT_NOTICE_ENABLED'));
+    hot.noticeMaxChars = Math.max(20, Math.min(500, numOr('BOT_NOTICE_MAX_CHARS', DEFAULTS.NOTICE_MAX_CHARS) || DEFAULTS.NOTICE_MAX_CHARS));
+    const ncv = pick('BOT_NOTICE_COOLDOWN_MS');
+    hot.noticeCooldownMs = ncv === '' || !Number.isFinite(Number(ncv))
+      ? DEFAULTS.NOTICE_COOLDOWN_MS : Math.min(3600000, Math.max(0, Number(ncv)));
+    hot.noticeAllowGroupAdmin = truthy(pick('BOT_NOTICE_ALLOW_GROUP_ADMIN'));
     return true;
   };
 
