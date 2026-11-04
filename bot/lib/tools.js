@@ -227,6 +227,32 @@ const create = ({ logger, hot, timers }) => {
   });
 };
 
+// ---------- 模型内部工具调用标记：识别 + 剔除（纯函数，可单测） ----------
+// deepseek-flash 这类推理模型偶发把“想调工具”的意图以内部标记写进 content：形态是全角竖线 U+FF5C 包的
+//   DSML 段（｜DSML｜invoke｜web_search｜…），或 <｜tool▁call▁begin｜> 一类的特殊 token。触发场景两类：
+//   ①工具轮被 max_tokens 截断（思考没写完就吐半截标记）；②末轮撤了 tools 却仍想调用（11-03 19:13 实测）。
+//   这些标记绝不是给用户看的正文，必须剔掉；参数值里可能自带半角 |，所以只认“标记起点”，起点之后整段丢弃。
+const MARKUP_START_RE = /<?\s*[|｜]{1,2}\s*(?:DSML|tool[^a-zA-Z]{0,3}(?:call|use)|invoke|arguments?|parameter|function|im_start|im_end)/i;
+const MARKUP_DOUBLE_RE = /[\uFF5C]{2}/;
+
+// 是否漏出了内部调用标记（末轮正文里出现成对全角竖线也算，沿用旧判据）
+const hasToolMarkup = (text) => {
+  const s = String(text || '');
+  if (!s) return false;
+  return MARKUP_START_RE.test(s) || MARKUP_DOUBLE_RE.test(s);
+};
+
+// 剔除标记：从最靠前的“标记起点”处截断，只留它之前的正文；正文里本没有标记时原样返回。
+const stripToolMarkup = (text) => {
+  const s = String(text || '');
+  if (!s) return '';
+  let i = s.search(MARKUP_START_RE);
+  const j = s.search(MARKUP_DOUBLE_RE);
+  if (i < 0) i = j; else if (j >= 0 && j < i) i = j;
+  if (i < 0) return s.trim();
+  return s.slice(0, i).replace(/[ \t]+\n/g, '\n').trim();
+};
+
 // 注入 system prompt 的能力说明（必须与 schemas() 实际下发的工具一致）
 const describeCapabilities = (hot) => {
   const parts = [];
@@ -285,4 +311,4 @@ const describeCapabilities = (hot) => {
   return parts.join('\n');
 };
 
-module.exports = { create, describeCapabilities, imagegenActive, imageSearchActive, readUrlActive, weather, websearch, timers: timersLib, imagegen: imagegenLib, imagesearch: imagesearchLib, readpage: readpageLib };
+module.exports = { create, describeCapabilities, hasToolMarkup, stripToolMarkup, imagegenActive, imageSearchActive, readUrlActive, weather, websearch, timers: timersLib, imagegen: imagegenLib, imagesearch: imagesearchLib, readpage: readpageLib };

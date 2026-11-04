@@ -4,14 +4,15 @@
 // 背景：QQ 里“合并转发”的聊天记录，OneBot 收到时是消息里的一个 type=forward 段（带 id，
 //   可能还带内联 content 节点数组）。Koishi 的 onebot adapter 只对 reply 做了原文兜底
 //   （见 lib/quote.js），forward 段原样留着 → 模型根本看不到被转发的那堆话。
-// 这里：优先用 adapter 内置的 internal.getForwardMsg(id) 拉子消息（复用已连的 ws）；
-//   再兜底 internal.request('get_forward_msg')；再兜底临时直连网关；最后兜底段里内联的 content。
+// 这里：拉子消息统一走网关动作助手 lib/onebot.js（internal._get → internal.request → 临时直连 WS）；
+//   最后兜底段里内联的 content。
 //   子消息的 content 既可能是 CQ 字符串、也可能是 segment 数组（NapCat/NTQQ 两种都见过），都归一。
 //   嵌套转发按深度上限递归；节点数与总字数都有上限，防爆 token / 防刷屏。
 // ⚠ 各网关返回体形状不完全一致，首次展开会把节点 keys 记一条 info，线上跑一次即可据此校准。
 
 const { normalizeText } = require('./text');
 const segmentsLib = require('./segments');
+const onebotLib = require('./onebot');
 
 const MAX_SEGS_PER_NODE = 20; // 单条子消息最多取几个段（防止一条里塞巨多段）
 
@@ -74,7 +75,9 @@ const asNodeArray = (data) => {
   return null;
 };
 
-const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001', segments }) => {
+// api 是网关动作助手（lib/onebot.js create 的返回值）；没注入时自建，便于单测与老调用点。
+const create = ({ logger = console, hot, api = null, wsEndpoint = 'ws://127.0.0.1:3001', wsToken = '', segments }) => {
+  const gateway = api && typeof api.callApi === 'function' ? api : onebotLib.create({ logger, wsEndpoint, wsToken });
   // 转发节点的段渲染复用统一分派表（lib/segments.js）：数组段能识别音乐/文件/未知卡片等并遥测；字符串段走 normalizeText。
   const segs = segments || segmentsLib.create({ logger, hot });
   const renderContent = (content) => {
@@ -83,40 +86,14 @@ const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001', seg
     if (Array.isArray(content)) return segs.renderSegs(content);
     return normalizeText(String(content));
   };
-  // 临时直连网关（get_msg 同款套路，3s 拿不到就放弃，不拖慢回复）
-  const wsGetForward = (id) => new Promise((resolve) => {
-    let socket;
-    try {
-      const WS = require('ws'); // koishi 既有依赖，惰性 require
-      socket = new WS(wsEndpoint);
-    } catch (_) { resolve(null); return; }
-    const timer = setTimeout(() => { try { socket.close(); } catch (_) { /* 忽略 */ } resolve(null); }, 3000);
-    socket.on('open', () => {
-      // id 与 message_id 都带上，兼容不同网关对参数名的要求
-      try { socket.send(JSON.stringify({ action: 'get_forward_msg', params: { id, message_id: id }, echo: 'fwd' })); } catch (_) { resolve(null); }
-    });
-    socket.on('message', (buf) => {
-      try {
-        const j = JSON.parse(String(buf));
-        if (j && j.echo === 'fwd') { clearTimeout(timer); try { socket.close(); } catch (_) { /* 忽略 */ } resolve(j.data ?? null); }
-      } catch (_) { /* 忽略非 JSON */ }
-    });
-    socket.on('error', () => { clearTimeout(timer); resolve(null); });
-  });
-
-  // 拉子消息：adapter 内置 → internal.request → 直连 WS
+  // 拉子消息：走网关动作助手（预算读 BOT_GW_TIMEOUT_MS，断连冷却内走快失败）；参数按文档同时带 id 与 message_id
   const fetchNodes = async (session, id) => {
-    const internal = session.bot?.internal;
-    let nodes = null;
-    try {
-      if (internal?.getForwardMsg) nodes = asNodeArray(await internal.getForwardMsg(id));
-      else if (internal?.request) nodes = asNodeArray(await internal.request('get_forward_msg', { message_id: id, id }));
-    } catch (error) {
-      logger.warn(`[转发] internal 拉取失败 id=${id}: ${String(error?.message || error).slice(0, 120)}`);
-    }
+    const res = await gateway.callApi(session, 'get_forward_msg', { id: String(id), message_id: String(id) }, {}); // 预算交给助手读 BOT_GW_TIMEOUT_MS
+    const nodes = asNodeArray(res.data);
     if (nodes) return nodes;
-    nodes = asNodeArray(await wsGetForward(id));
-    return nodes;
+    logger.warn(`[转发] get_forward_msg(${id}) 没拿到子消息：`
+      + String(res.ok ? '返回里没有 messages 数组' : (res.error || '无返回')).slice(0, 200));
+    return null;
   };
 
   // 递归收集子消息进 acc.list（受深度/节点数上限约束）
@@ -190,18 +167,16 @@ const create = ({ logger = console, hot, wsEndpoint = 'ws://127.0.0.1:3001', seg
   //   （此时当前消息 els=[at,text] 不带 forward 段，卡片在你引用的那条消息里）
   const detectForwardIdOfMessage = async (session, msgId) => {
     if (!msgId) return '';
-    const internal = session.bot?.internal;
-    let data = null;
-    try {
-      if (internal?.getMsg) data = await internal.getMsg(msgId);
-      else if (internal?.request) data = await internal.request('get_msg', { message_id: Number(msgId) || msgId });
-    } catch (error) {
-      logger.warn(`[转发] getMsg 取引用消息失败 id=${msgId}: ${String(error?.message || error).slice(0, 120)}`);
+    const res = await gateway.callApi(session, 'get_msg', { message_id: Number(msgId) || msgId }, {}); // 预算交给助手读 BOT_GW_TIMEOUT_MS
+    if (!res.ok) {
+      logger.warn(`[转发] get_msg 取引用消息失败 id=${msgId}: ` + String(res.error || '无返回').slice(0, 160));
       return '';
     }
+    const data = res.data;
     const id = extractForwardId(data);
-    if (id) logger.info(`[转发] 被引用消息 ${msgId} 是转发卡片 forwardId=${id}`);
-    else if (data) logger.info(`[转发] 被引用消息 ${msgId} 未识别出 forward id（get_msg keys=${Object.keys(data).join('/')} message=${Array.isArray(data.message) ? 'array' : typeof data.message}），跳过展开`);
+    if (id) logger.info(`[转发] 被引用消息 ${msgId} 是转发卡片 forwardId=${id}（走 ${res.via}）`);
+    // 引用的常是普通文本消息，这时“没 forward id”是正常结果，记清消息类型才看得出是不是真漏了卡片
+    else if (data) logger.info(`[转发] 被引用消息 ${msgId} 不是转发卡片（走 ${res.via} message_type=${data.message_type || '?'} message=${Array.isArray(data.message) ? (data.message.map((x) => x && x.type).join(',') || '空') : typeof data.message}），跳过展开`);
     return id;
   };
 

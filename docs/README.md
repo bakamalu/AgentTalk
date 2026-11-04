@@ -4,11 +4,12 @@
 |---|---|---|
 | [01-architecture.md](01-architecture.md) | 分层架构、关键机制、状态键设计、网关契约 | 想改代码的人 |
 | [02-operations.md](02-operations.md) | 部署结构、启停、验证命令、常见故障 | 运维 / 排查故障 |
-| [03-dev-log.md](03-dev-log.md) | 从零到现在的完整改造记录（19 项修复 + 踩坑） | 追溯"为什么这么写" |
+| [03-dev-log.md](03-dev-log.md) | 从零到现在的完整改造记录（23 项修复 + 踩坑） | 追溯"为什么这么写" |
 | [04-migration-snowluma.md](04-migration-snowluma.md) | 网关迁移路线 B：三次可回滚窗口 | 执行迁移的人 |
 | [05-external-links.md](05-external-links.md) | 第三方项目外链、许可与版本 | 环境重建 |
 | [06-snowluma-todo.md](06-snowluma-todo.md) | SnowLuma 收尾待办（P0~P3，含风控阻塞与脚本债） | 接手收尾 / 恢复登录 |
 | [07-wechat-bot.md](07-wechat-bot.md) | 微信机器人接入方案（选型对比、架构映射、实施路线） | 决定"微信怎么接"的人 |
+| [08-gateway-api.md](08-gateway-api.md) | 网关接口速查：调用口径（含离线重试/冷却）、已接入动作、网关抖动实测口径、193 个动作全表 | **加新能力前先查这里有没有现成 API** |
 | [decisions/](decisions/) | ADR（架构决策记录） | 想知道"为什么不选另一个" |
 
 ---

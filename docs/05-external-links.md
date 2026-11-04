@@ -31,7 +31,10 @@
 | 资源 | 链接 |
 |---|---|
 | OneBot v11 标准 | https://github.com/botuniverse/onebot-11 |
-| SnowLuma 动作参考 | https://snowluma.github.io/zh/docs/api |
+| SnowLuma 动作参考 | https://snowluma.github.io/zh/docs/api （速查已抽进本仓库 [08-gateway-api.md](08-gateway-api.md)） |
+| SnowLuma 文档站整站正文 | https://snowluma.github.io/llms-full.txt ；本地快照 `/root/snowluma-docs/`（`bash scripts/crawl-snowluma-docs.sh`） |
+| SnowLuma 接口目录（机器可读，193 个动作） | https://snowluma.github.io/api/catalog.json ；本地克隆 `/root/code/SnowLumaDocs/public/api/catalog.json` |
+| SnowLuma 文档站源码 | https://github.com/SnowLuma/SnowLumaDocs （本机克隆在 `/root/code/SnowLumaDocs`） |
 | SnowLuma SDK | https://www.npmjs.com/package/@snowluma/sdk |
 | SnowLuma MCP | https://www.npmjs.com/package/@snowluma/mcp |
 | DeepSeek API | https://api.deepseek.com |

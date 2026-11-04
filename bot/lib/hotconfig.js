@@ -78,6 +78,30 @@ const DEFAULTS = {
   NOT_MINE_WORDS: ['没跟你说话', '不是跟你说话', '没跟你说', '不是跟你说', '没说你', '不是在说你', '不用你回', '不用回', '别接', '跟你没关系', '不是对你说的', '没对你讲'],
   NOT_MINE_REPLY: '好的',
   INTENT_TIMEOUT_MS: 6000,        // 意图判定这一发小请求的超时（超时即偏向沉默）
+  // 引用消息周边对话检索（见 lib/quote.js retrieveAroundQuote）：仅群聊、且本轮存在引用消息时生效。
+  //   群历史按锚点双向分页取（网关动作 get_group_msg_history：message_id + count + reverse_order，
+  //   true=锚点及更旧、false=锚点及更新，两次并发后按 message_id 去重），再按「滑动窗口（断档截断）」圈时段：沿引用发送人自己的发言双向
+  //   推进，他一超过 CHAIN_MS（默认 10 分钟）没再说话就在那儿截断，得到 [y0,y] 后首尾各垫一个 CHAIN_MS，
+  //   即窗口 [y0-gap, y+gap]，并用 MAX_MS 封顶单侧（默认 15 分钟、总跨度 30 分钟）。
+  //   时段内的讨论对象先按结构信号定（引用过锚点发送人的消息 / @ 过他 / 紧接其发言接话的人），
+  //   一条都没命中且确有候选人时才交给 AI 补判一次；命中者的发言一并保留，
+  //   拼成背景块喂模型（标注素材非指令），上限 MAX_CHARS 字、超限时优先保留靠近锚点的部分。
+  QUOTE_CONTEXT_ENABLED: true,
+  QUOTE_CONTEXT_CHAIN_MS: 600000,  // 断档阈值 gap：发送人超过该时长没再说话就截断窗口，同时是首尾垫的宽度
+  QUOTE_CONTEXT_MAX_MS: 900000,    // 硬边界：距锚点超过该值的消息一律不要（单侧 15 分钟 = 总跨度 30 分钟）
+  QUOTE_CONTEXT_MAX_CHARS: 1500,   // 背景块喂模型的总字数上限
+  //   存档字数：背景块原本只喂当轮就扔，下一轮追问「这事前因后果」时模型只看到一句引用
+  //   （11-04 13:12 实测：13:11 检索到 6 行背景答对了，13:12 追问就答「我只看得到一句引用」）。
+  //   所以按这个字数再存一份压缩版进会话历史（靠近锚点的优先留）；0 = 不沉淀，维持老行为。
+  QUOTE_CONTEXT_HISTORY_CHARS: 400,
+  QUOTE_CONTEXT_FETCH_COUNT: 60,   // 单侧条数（锚点前/锚点后各拉这么多）：实测单侧 200 条要走 ~14s（撞 6s 超时），60 条约 2.3s
+  // 网关动作调用（lib/onebot.js callApi）：一次调用的总预算，与「连不上」时的重试间隔。
+  //   SnowLuma 那侧的 QQ 会话会周期性重登，每次把 3001 关掉 5~18 秒（11-04 实测：发作时每 1~5 分钟一次），
+  //   检索撞在窗口里就会“取不到历史”，所以预算内要等重连。预算 ≥ 断窗长度才盖得住：
+  //   断连变凶就调大 BOT_GW_TIMEOUT_MS（改完热生效、不用重发版），代价是撞窗时那条回复多等几秒。
+  GATEWAY_TIMEOUT_MS: 6000,         // 总预算（1000~20000）；三档降级共用，不是每档各等一遍
+                                    // 线上按实测断窗分位取 12000（p75=13s，盖 73% 的窗），见 config/bot.env.example
+  GATEWAY_RETRY_INTERVAL_MS: 1200,  // 离线重试间隔；0=关掉重试（只想快速失败时用）
   IMAGEGEN_PROTOCOL: 'dashscope', // dashscope（百炼原生，wan/qwen 实测同步可用）| openai（标准 /images/generations）
   IMAGEGEN_ENDPOINT: '',          // 仅 dashscope 需覆盖时填完整 URL；空=由 base 推 origin 拼原生路径
 };
@@ -127,6 +151,9 @@ const HOT_KEYS = [
   'BOT_IMAGE_SEARCH_ENABLED', 'BOT_IMAGE_SEARCH_MAX_CANDIDATES', 'BOT_IMAGE_SEARCH_VERIFY_MAX',
   'BOT_READURL_ENABLED', 'BOT_READURL_MAX_CHARS', 'BOT_READURL_TIMEOUT_MS',
   'BOT_REPLY_INTENT_CHECK', 'BOT_NOT_MINE_WORDS', 'BOT_NOT_MINE_REPLY', 'BOT_INTENT_TIMEOUT_MS',
+  'BOT_QUOTE_CONTEXT_ENABLED', 'BOT_QUOTE_CONTEXT_CHAIN_MS', 'BOT_QUOTE_CONTEXT_MAX_MS',
+  'BOT_QUOTE_CONTEXT_MAX_CHARS', 'BOT_QUOTE_CONTEXT_HISTORY_CHARS', 'BOT_QUOTE_CONTEXT_FETCH_COUNT',
+  'BOT_GW_TIMEOUT_MS', 'BOT_GW_RETRY_INTERVAL_MS',
 ];
 
 const create = ({ config, logger, botEnvFile }) => {
@@ -178,6 +205,11 @@ const create = ({ config, logger, botEnvFile }) => {
       BOT_IMAGE_SEARCH_ENABLED: config.imageSearchEnabled, BOT_IMAGE_SEARCH_MAX_CANDIDATES: config.imageSearchMaxCandidates, BOT_IMAGE_SEARCH_VERIFY_MAX: config.imageSearchVerifyMax,
       BOT_READURL_ENABLED: config.readUrlEnabled, BOT_READURL_MAX_CHARS: config.readUrlMaxChars, BOT_READURL_TIMEOUT_MS: config.readUrlTimeoutMs,
       BOT_REPLY_INTENT_CHECK: config.replyIntentCheck, BOT_NOT_MINE_WORDS: config.notMineWords, BOT_NOT_MINE_REPLY: config.notMineReply, BOT_INTENT_TIMEOUT_MS: config.intentTimeoutMs,
+      BOT_QUOTE_CONTEXT_ENABLED: config.quoteContextEnabled, BOT_QUOTE_CONTEXT_CHAIN_MS: config.quoteContextChainMs,
+      BOT_QUOTE_CONTEXT_MAX_MS: config.quoteContextMaxMs, BOT_QUOTE_CONTEXT_MAX_CHARS: config.quoteContextMaxChars,
+      BOT_QUOTE_CONTEXT_HISTORY_CHARS: config.quoteContextHistoryChars,
+      BOT_QUOTE_CONTEXT_FETCH_COUNT: config.quoteContextFetchCount,
+      BOT_GW_TIMEOUT_MS: config.gatewayTimeoutMs, BOT_GW_RETRY_INTERVAL_MS: config.gatewayRetryIntervalMs,
     };
     const strOr = (v, d) => (v === undefined || v === null || v === '' ? d : String(v));
     const pick = (key) => strOr(parsed[key], strOr(fromConfig[key], strOr(process.env[key], '')));
@@ -272,6 +304,20 @@ const create = ({ config, logger, botEnvFile }) => {
     hot.notMineWords = pick('BOT_NOT_MINE_WORDS') === '' ? DEFAULTS.NOT_MINE_WORDS.slice() : toWordList(pick('BOT_NOT_MINE_WORDS'));
     hot.notMineReply = pick('BOT_NOT_MINE_REPLY') || DEFAULTS.NOT_MINE_REPLY;
     hot.intentTimeoutMs = Math.max(1000, numOr('BOT_INTENT_TIMEOUT_MS', DEFAULTS.INTENT_TIMEOUT_MS) || DEFAULTS.INTENT_TIMEOUT_MS);
+    // 引用周边对话检索：默认开（空=开），仅群聊生效；参数含义见 DEFAULTS 上方注释块。
+    hot.quoteContextEnabled = pick('BOT_QUOTE_CONTEXT_ENABLED') === '' ? true : truthy(pick('BOT_QUOTE_CONTEXT_ENABLED'));
+    hot.quoteContextChainMs = Math.max(60000, numOr('BOT_QUOTE_CONTEXT_CHAIN_MS', DEFAULTS.QUOTE_CONTEXT_CHAIN_MS) || DEFAULTS.QUOTE_CONTEXT_CHAIN_MS);
+    hot.quoteContextMaxMs = Math.max(120000, Math.min(1800000, numOr('BOT_QUOTE_CONTEXT_MAX_MS', DEFAULTS.QUOTE_CONTEXT_MAX_MS) || DEFAULTS.QUOTE_CONTEXT_MAX_MS));
+    hot.quoteContextMaxChars = Math.max(200, Math.min(6000, numOr('BOT_QUOTE_CONTEXT_MAX_CHARS', DEFAULTS.QUOTE_CONTEXT_MAX_CHARS) || DEFAULTS.QUOTE_CONTEXT_MAX_CHARS));
+    hot.quoteContextFetchCount = Math.max(20, Math.min(200, numOr('BOT_QUOTE_CONTEXT_FETCH_COUNT', DEFAULTS.QUOTE_CONTEXT_FETCH_COUNT) || DEFAULTS.QUOTE_CONTEXT_FETCH_COUNT));
+    // 存档字数允许填 0（=不沉淀），所以不能套 `|| DEFAULT`（0 会被吃成默认值，和 BOT_GW_RETRY_INTERVAL_MS 同坑）；
+    //   填了非数字则退回默认，别拿 0 当「写错了」的兜底——0 是有语义的。
+    const hcv = pick('BOT_QUOTE_CONTEXT_HISTORY_CHARS');
+    hot.quoteContextHistoryChars = hcv === '' || !Number.isFinite(Number(hcv))
+      ? DEFAULTS.QUOTE_CONTEXT_HISTORY_CHARS : Math.min(1500, Math.max(0, Number(hcv)));
+    // 网关调用预算/重试：retry 间隔允许填 0（=关重试），所以不能用 `|| DEFAULT` 兜（0 会被吃掉）。
+    hot.gatewayTimeoutMs = Math.max(1000, Math.min(20000, numOr('BOT_GW_TIMEOUT_MS', DEFAULTS.GATEWAY_TIMEOUT_MS) || DEFAULTS.GATEWAY_TIMEOUT_MS));
+    hot.gatewayRetryIntervalMs = Math.min(5000, numOr('BOT_GW_RETRY_INTERVAL_MS', DEFAULTS.GATEWAY_RETRY_INTERVAL_MS));
     return true;
   };
 
