@@ -89,6 +89,30 @@ const renderElement = (el, mode, telemetry) => {
   }
 };
 
+// 当前消息正文（进模型的那份）：text 原样；at 渲染成 `@QQ<id>`（机器人自己的 @ 去掉、@全体单列）；
+//   其余段沿用 body 口径的占位符。
+//   ⚠ 不能直接用 normalizeText：它会把 at 段抹成空格，用户说「总结一下@某某 他的记录」时
+//   模型只剩一个空代词（11-05 18:42 实测：正文分明有 @，回复却是“得先知道指的是谁”）。
+const bodyOfElements = (elements, selfId) => {
+  const els = Array.isArray(elements) ? elements : [];
+  if (!els.length) return '';
+  const self = String(selfId || '');
+  const parts = [];
+  for (const el of els) {
+    if (!el) continue;
+    if (el.type === 'at') {
+      const a = attrsOf(el);
+      const id = String(a.id ?? a.qq ?? '');
+      if (!id || id === self) continue; // 唤醒用的 @机器人 不进正文
+      if (id === 'all' || id === '全部' || id === '全体') { parts.push(' @全体成员 '); continue; }
+      parts.push(' @QQ' + id + ' '); // 昵称由插件在回复前补（群成员表有缓存）
+      continue;
+    }
+    parts.push(renderElement(el, 'body'));
+  }
+  return parts.join('').replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim();
+};
+
 const create = ({ logger = console, hot } = {}) => {
   const seen = new Set(); // 遥测去重：同一未识别 type 一个进程只记一次，避免刷屏
   const telemetry = (type, keys) => {
@@ -126,4 +150,4 @@ const create = ({ logger = console, hot } = {}) => {
   return { describeNonText, renderSegs, renderElement, telemetry, normalizeText };
 };
 
-module.exports = { create, KNOWN, attrsOf, renderElement, cardMeta };
+module.exports = { create, KNOWN, attrsOf, renderElement, bodyOfElements, cardMeta };

@@ -89,6 +89,11 @@
    11-04 下午的处理：太薄就沿引用链上溯换锚点再找一轮（见第 8 条），仍然找不着才承认没记录。
    复核不要只靠检索日志，直连网关把锚点前后各 60 条带日期打出来看：`/root/probe_ctx.cjs`。
 8. 上溯（`BOT_QUOTE_CONTEXT_HOP_MAX`）用的是**同一个动作换个 `message_id` 再问一批**，实测 ~2.4s/批：十跳全问网关就是 24s，所以深度闸之外还得配时间闸（`BOT_QUOTE_CONTEXT_HOP_BUDGET_MS`）；上溯目标若已在上一批返回里（紧邻引用这种常见情形）就不重复调用，那种跳是免费的。
+9. **背景行的说话人一律渲成「昵称(uid)」**（`assembleLines` 的 `render`；拿不到昵称退回 `QQ<uid>`），@前群上下文与转发块同口径。只写昵称时同名/改名就分不清人，模型会把几个人的话归成一个人；11-04 21:32 那轮「把不同对象的聊天记录混在一块」就是在这种无归属的行上发作的（详见 `03-dev-log.md` 第二十六节）。
+   同一个坑还有一半：**`[CQ:at,qq=X]` 必须在 `normalizeText` 之前换成 `@昵称(uid)`**（池里没有这人就 `@QQ<uid>`，`@全体` 写 `@全体成员`），因为 `normalizeText` 会把 at 段直接抹成空格——`总结一下@某人 他的聊天记录` 一旦只剩空代词，「他」就永远对不上号（11-05 14:59）；锚点自己 @ 到的人同时并入讨论对象，即便他这段没开口。
+   若他在引用前后那段里一句没说，还会从**同一批已拉回的群历史**里补一段「他在本群最近的发言」（最多 12 条/600 字，按最新取、升序输出、不含本轮触发消息、不进存档）——同群可查，不需要本人同意（11-05 口径）。
+10. 正文（当前消息）是另一条通道。`lib/segments.bodyOfElements` 把 at 渲成 `@QQ<uid>`（机器人自己的 @ 去掉、`@全体` 写 `@全体成员`），插件再用 `getGuildMemberList` 补成 `@昵称(uid)`——**不能直接用 `normalizeText`**，它会把 at 抹成空格（11-05 18:42 实测：正文有 @，模型只看到“总结一下 他的聊天记录”，答“得先知道指的是谁”）。没有引用、只是正文 @ 了别人时，由 `retrieveSpeakerRecent()` 现拉最近群历史补「他最近的发言」（单次 120 条、6s 上限；带锚点空返回就退回 `message_id=0` 取最近 N 条）。
+11. **adapter 会在插件之前丢掉引用节点**：`adaptMessage` 先 `elements.shift()` 摸掉 reply 再 `await bot.getMessage(...)`，拉不到就静默不给 `quote`，reply id 也从 content/elements 里消失（重启后第一条带引用消息最易中）。两道防线：插件在 init + `ctx.on('ready')` 就用 `maybePatchBot(bot)` 把 `getMessage` 挂上（不等第一条消息）；`findRawReplyId` 最后会扫平台原始 payload（`session.onebot.raw_message` / `message[]` / `event._data`）找回 id，再走 `get_msg` 兜底。另外引用原文自己的 at 也要先过 `renderQuoteAt()`（CQ 串与 `<at id=""/>` 都认）换成 `@QQ<uid>` 再 `normalizeText`，否则被引用的「总结一下 @某人 的聊天记录」又只剩空代词。
 
 调用位置：`bot/lib/quote.js` 的 `retrieveAroundQuote()`（两页并发）。
 

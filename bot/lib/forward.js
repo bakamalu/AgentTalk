@@ -122,9 +122,13 @@ const create = ({ logger = console, hot, api = null, wsEndpoint = 'ws://127.0.0.
   };
 
   // 渲染成喂给模型的文本块（带说话人前缀；总字数截断兜底）
+  //   前缀统一「昵称(uid)」：转发里经常混着好几个人，只写昵称模型就会把不同人说的话归成一个人。
   const renderBlock = (acc) => {
     if (!acc.list.length) return '';
-    const lines = acc.list.map((n) => `- [${n.name || ('QQ' + n.uid) || '?'}] ${n.text || '(空)'}`);
+    const lines = acc.list.map((n) => {
+      const who = n.name && n.name !== n.uid ? `${n.name}(${n.uid})` : (n.uid ? `QQ${n.uid}` : '?');
+      return `- [${who}] ${n.text || '(空)'}`;
+    });
     let block = lines.join('\n');
     if (block.length > hot.forwardMaxChars) block = block.slice(0, hot.forwardMaxChars) + '…(截断)';
     if (acc.truncated) block += `\n（以上仅取前 ${hot.forwardMaxNodes} 条，其余省略）`;

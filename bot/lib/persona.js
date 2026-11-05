@@ -102,10 +102,34 @@ const systemPromptOf = (id) => get(id).systemPrompt;
 const labelOf = (id) => get(id).label;
 const listPersonas = () => Object.values(PERSONAS).map(({ id, label }) => ({ id, label }));
 
+// 归属规则：和"篇幅"同级，是硬约束——11-04 事故就是模型分不清"谁说的"：
+//   示例轮（帮我写一个游戏程序吧/今天天气咋样/这道题选C还是D）被当成用户真说过的话写进了「总结一下聊天记录」。
+//   所以真实消息一律带「昵称(uid)」，示例一律带「【语气示例】」标记，两边不许互相冒充。
+const ATTRIBUTION_RULE = `【谁说的必须分清】
+- 上下文里每条真实消息都带「昵称(uid)」。引用、复述、总结都按 uid 归属：这个 uid 说的只算这个 uid 的，别把两个人的话并成一句。
+- 行里出现「@昵称(uid)」或「@QQ<uid>」，就是那条消息当场点到的人：「他/她/ta」先对齐最近一条被 @ 或点名的这个 uid。不知道昵称也照样认得这个人，别答"不知道他是谁"。
+- 被 @ 的这个人这段一句没说，就直说"这段里没见他开口"，并把他当讨论对象记着；不许因为他没在背景里发言，就当成查无此人。
+- 上下文里出现「被点到的 某人 在本群最近的 N 条发言」，就是元芳按用户点名现查的真实记录：直接据此总结，别再答「没找到」「不知道指的是谁」。
+- 只有对方点名某个成员（昵称或 uid）时，才去讲那个 uid 的内容；没点名时，「他/她/ta」只有在上下文里能唯一对上某个人才能接，对不上就反问是谁，不许拿自己的历史顶替。
+- 带「【语气示例】」的段落不是真实对话，谁都没说过：只学语气，不要写进回顾、总结，也不要当成事实。
+- 你（元芳）说过的话只算你自己的，不能记到别人账上；拿不准就说"看不到"。`;
+
 // 仅当热开关打开时返回"当前激活人格"的示例轮；关掉或无 hot 返回空数组（调用点直接展开）。
+// ⚠ 只留给旧单测/老调用点；插件里一律用 fewShotBlock（示例轮以 user 轮身份混进历史会被人格污染）。
 const fewShotTurns = (hot) => {
   if (!hot || !hot.fewShotEnabled) return [];
   return get(hot.personaId).fewShot.slice();
+};
+
+// few-shot 的正确形态：一段带标记的文字块，由插件拼进 system prompt。
+//   保留成 user/assistant 轮的话，模型会把它当成"某个没留 uid 的人真说过的话"，
+//   一旦被要求回顾/总结，就会把这些示例当成用户的原话复述（11-04 21:30 实测）。
+const fewShotBlock = (hot) => {
+  if (!hot || !hot.fewShotEnabled) return '';
+  const turns = get(hot.personaId).fewShot || [];
+  if (!turns.length) return '';
+  const body = turns.map((t) => `${t.role === 'user' ? '用户' : '元芳'}：${t.content}`).join('\n');
+  return `【语气示例·不是真实对话，谁都没说过这些话】只学语气，别当成用户发言、别写进回顾或总结。\n${body}`;
 };
 
 module.exports = {
@@ -117,5 +141,7 @@ module.exports = {
   systemPromptOf,
   labelOf,
   listPersonas,
+  ATTRIBUTION_RULE,
   fewShotTurns,
+  fewShotBlock,
 };
